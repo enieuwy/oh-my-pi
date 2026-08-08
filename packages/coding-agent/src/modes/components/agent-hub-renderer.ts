@@ -99,19 +99,29 @@ export function formatResolvedModelBadge(
 /**
  * Resolved model + reasoning level for a hub row. Exact executor progress is
  * authoritative (and survives completion); direct live sessions are the
- * fallback for agents without an observer snapshot.
+ * fallback for agents without an observer snapshot — the main session has no
+ * snapshot at all, so its row is read straight off the live session.
+ *
+ * Every source reports the model that produced the row's work, never the one
+ * the session merely points at: an armed fallback that has not served yet stays
+ * attributed to whichever model last actually spoke.
  */
 export function modelBadge(ref: AgentRef, observed: ObservableSession | undefined): string | undefined {
 	const progress = observed?.progress;
 	const liveThinkingLevel = ref.session?.thinkingLevel;
+	const serving = ref.session?.servingModel;
 	const fallbackSelector =
-		ref.session?.retryFallbackModel ??
+		(serving?.isFallback ? serving.selector : undefined) ??
 		(progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined) ??
-		(ref.history?.resolvedModelIsFallback ? ref.history.resolvedModel : undefined);
+		(ref.history?.resolvedModelIsFallback ? ref.history.resolvedModel : undefined) ??
+		// Nothing has served at all, so there is no earlier work to miscredit and
+		// the armed candidate is all there is to report — but it is still a
+		// fallback, and a bare model badge would hide that.
+		(serving ? undefined : ref.session?.pendingRetryFallbackModel);
 	if (fallbackSelector) {
 		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true, liveThinkingLevel)}`;
 	}
-	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel;
+	const resolvedModel = progress?.resolvedModel ?? ref.history?.resolvedModel ?? serving?.selector;
 	if (resolvedModel) return formatResolvedModelBadge(resolvedModel, false, liveThinkingLevel);
 	const model = ref.session?.model;
 	if (!model) return undefined;

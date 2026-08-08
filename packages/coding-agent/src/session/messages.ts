@@ -497,6 +497,62 @@ export function isEmptyErrorTurn(message: Pick<AssistantMessage, "stopReason" | 
 	});
 }
 
+/** Non-whitespace text. Tolerates malformed blocks: transcripts replayed off
+ *  disk predate current shapes, and a missing field must not throw. */
+function hasText(content: { text?: unknown }): boolean {
+	return typeof content.text === "string" && content.text.trim().length > 0;
+}
+
+/** A block a consumer can act on: a call, real text, or provider-signed thinking. */
+function isActionableContent(content: AssistantMessage["content"][number] | undefined): boolean {
+	if (!content) return false;
+	if (content.type === "toolCall") return true;
+	if (content.type === "text") return hasText(content);
+	// Unsigned thinking is not actionable; a signature is provider-authenticated.
+	return content.type === "thinking" && typeof content.thinkingSignature === "string"
+		? content.thinkingSignature.trim().length > 0
+		: false;
+}
+
+/** A `stop`/`toolUse` turn that produced nothing actionable. Any other stop
+ *  reason is not an "empty stop": an `error`/`aborted` turn is a failure rather
+ *  than an empty completion, and a `length` stop was cut off mid-output. */
+export function isEmptyAssistantStop(message: Pick<AssistantMessage, "stopReason" | "content">): boolean {
+	switch (message.stopReason) {
+		case "stop":
+			return !message.content.some(isActionableContent);
+		case "toolUse":
+			// An orphaned toolUse stop (no tool_use block) corrupts Anthropic history:
+			// a later tool_result has nothing to anchor to. Thinking alone cannot anchor
+			// a tool_result, so it does not rescue a toolUse stop here.
+			return !message.content.some(
+				content => content?.type === "toolCall" || (content?.type === "text" && hasText(content)),
+			);
+		default:
+			return false;
+	}
+}
+
+/**
+ * True when this assistant turn actually produced output, making its model the
+ * one that served the run.
+ *
+ * Attribution asks this from two places that MUST reach the same verdict: the
+ * live session, which flips a fallback to "served", and the offline walk
+ * replaying a transcript. `error` and `aborted` are both failures — a stalled or
+ * dropped stream is finalized as `aborted` with its partial block still
+ * attached, so a stop reason alone is not proof.
+ *
+ * Actionable content is required on top of the empty-stop rule, which only
+ * inspects `stop`/`toolUse`. A `length` stop burns the whole output budget
+ * without necessarily emitting anything usable, and every other stop reason
+ * bypasses that rule entirely.
+ */
+export function assistantTurnProducedOutput(message: Pick<AssistantMessage, "stopReason" | "content">): boolean {
+	if (message.stopReason === "error" || message.stopReason === "aborted") return false;
+	return !isEmptyAssistantStop(message) && message.content.some(isActionableContent);
+}
+
 /** Sentinel `errorMessage` the agent stamps on any abort that carried no custom
  *  reason (bare `abort()`). Renderers treat it as "no specific reason given". */
 export const GENERIC_ABORT_SENTINEL = "Request was aborted";

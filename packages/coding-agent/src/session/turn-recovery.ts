@@ -44,7 +44,7 @@ import type {
 	UsageFallbackConfirmation,
 	UsageFallbackConfirmer,
 } from "./agent-session-types";
-import { isEmptyErrorTurn } from "./messages";
+import { assistantTurnProducedOutput, isEmptyAssistantStop, isEmptyErrorTurn } from "./messages";
 import {
 	type ActiveRetryFallbackState,
 	calculateRetryBackoffDelayMs,
@@ -189,6 +189,17 @@ export class TurnRecovery {
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#acceptTerminalEmptyStopForPrompt = false;
+	/** Attribution of the newest turn that produced output, held across unproven switches. */
+	#lastServedModel: ServingModel | undefined;
+	/** Memoized {@link servingModel}, keyed by the inputs that shape its selector. */
+	#servingModelCache:
+		| {
+				model: Model;
+				level: ThinkingLevel | undefined;
+				fallback: ActiveRetryFallbackState | undefined;
+				value: ServingModel;
+		  }
+		| undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -197,6 +208,12 @@ export class TurnRecovery {
 				...options.initialRetryFallback,
 				lastAppliedFallbackThinkingLevel: host.configuredThinkingLevel(),
 				pinned: options.initialRetryFallback.pinned ?? false,
+				// Selected before this session ran, so on a fresh session it owns
+				// every turn from the first request and there is no earlier model's
+				// work to misattribute. A RESUMED transcript already holds turns some
+				// other model produced, so there the candidate stays unproven until
+				// it answers here.
+				served: !host.agent.state.messages.some(message => message.role === "assistant"),
 			};
 		}
 		this.#validateRetryFallbackChains();
@@ -212,12 +229,48 @@ export class TurnRecovery {
 		return this.#retryPromise;
 	}
 
-	/** Resolved selector while fallback routing owns the current model. */
-	get retryFallbackModel(): string | undefined {
+	/**
+	 * Model this session's produced work is attributed to.
+	 *
+	 * A model switch is a routing decision, not evidence the target can produce
+	 * anything. A fallback candidate that errors on its first request — an
+	 * exhausted quota, a hard provider error — produced none of the turns already
+	 * in this session, so while one is armed and unproven the answer stays with
+	 * the model that last actually served. Observers that reported the current
+	 * model instead credited a whole run to a model that never spoke.
+	 */
+	get servingModel(): ServingModel | undefined {
 		const model = this.#host.model();
-		return this.#activeRetryFallback && model
-			? formatRetryFallbackSelector(model, this.#host.thinkingLevel())
-			: undefined;
+		if (!model) return this.#lastServedModel;
+		const fallback = this.#activeRetryFallback;
+		if (fallback && !fallback.served) return this.#lastServedModel;
+		// Observers poll this per streaming event and per render; formatting a
+		// selector each time would allocate on the hot path. Inputs are compared
+		// by identity and value, so a steady session reuses one object.
+		const level = this.#host.thinkingLevel();
+		const cached = this.#servingModelCache;
+		if (cached && cached.model === model && cached.level === level && cached.fallback === fallback) {
+			return cached.value;
+		}
+		const value: ServingModel = {
+			selector: formatRetryFallbackSelector(model, level),
+			isFallback: fallback !== undefined,
+		};
+		this.#servingModelCache = { model, level, fallback, value };
+		return value;
+	}
+
+	/**
+	 * Selector of a fallback that is armed but has not served yet.
+	 *
+	 * Nothing has been attributed to it, so it is not the serving model — but
+	 * when the session has produced no output at all there is no earlier work to
+	 * miscredit, and naming it is the only honest thing an observer can show.
+	 */
+	get pendingRetryFallbackModel(): string | undefined {
+		const model = this.#host.model();
+		if (!model || !this.#activeRetryFallback || this.#activeRetryFallback.served) return undefined;
+		return formatRetryFallbackSelector(model, this.#host.thinkingLevel());
 	}
 
 	/** Resets per-prompt recovery counters and terminal-stop acceptance. */
@@ -232,23 +285,36 @@ export class TurnRecovery {
 		this.#acceptTerminalEmptyStopForPrompt = accept;
 	}
 
-	/** Closes a successful retry saga and annotates recovered persisted errors. */
+	/**
+	 * Records which model produced this turn, marks an active fallback as having
+	 * served, then closes a successful retry saga and annotates recovered
+	 * persisted errors.
+	 */
 	async onAssistantSettledSuccessfully(message: AssistantMessage): Promise<void> {
-		if (
-			message.stopReason === "error" ||
-			message.stopReason === "aborted" ||
-			this.#isEmptyAssistantStop(message) ||
-			this.#retryAttempt === 0
-		) {
+		if (!assistantTurnProducedOutput(message)) {
 			return;
 		}
 		const model = this.#host.model();
-		if (this.#activeRetryFallback && model) {
+		if (model) {
+			this.#lastServedModel = {
+				selector: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+				isFallback: this.#activeRetryFallback !== undefined,
+			};
+		}
+		// Independent of the retry saga below: a usage-aware fallback is applied
+		// before a request without ever incrementing `#retryAttempt`, and it still
+		// owns every turn it serves. Gating this on the saga left such a fallback
+		// permanently unproven, hiding it from observers for the whole session.
+		if (this.#activeRetryFallback && !this.#activeRetryFallback.served && model) {
+			this.#activeRetryFallback.served = true;
 			await this.#host.emitSessionEvent({
 				type: "retry_fallback_succeeded",
-				model: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+				model: this.#lastServedModel?.selector ?? formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
 				role: this.#activeRetryFallback.role,
 			});
+		}
+		if (this.#retryAttempt === 0) {
+			return;
 		}
 		const recoveredErrors = await this.#markPendingRecoveredRetryErrors(message);
 		await this.#host.emitSessionEvent({
@@ -519,7 +585,7 @@ export class TurnRecovery {
 	}
 
 	async #handleEmptyAssistantStop(assistantMessage: AssistantMessage): Promise<boolean> {
-		if (!this.#isEmptyAssistantStop(assistantMessage)) {
+		if (!isEmptyAssistantStop(assistantMessage)) {
 			this.#emptyStopRetryCount = 0;
 			return false;
 		}
@@ -566,31 +632,6 @@ export class TurnRecovery {
 		});
 		this.#host.scheduleAgentContinue({ generation: this.#host.promptGeneration() });
 		return true;
-	}
-
-	#isEmptyAssistantStop(assistantMessage: AssistantMessage): boolean {
-		switch (assistantMessage.stopReason) {
-			case "stop":
-				// Unsigned thinking alone is not actionable, but a signature is
-				// provider-authenticated content and makes the stop terminal.
-				for (const content of assistantMessage.content) {
-					if (content.type === "toolCall") return false;
-					if (content.type === "text" && hasNonWhitespace(content.text)) return false;
-					if (content.type === "thinking" && hasNonWhitespace(content.thinkingSignature ?? "")) return false;
-				}
-				return true;
-			case "toolUse":
-				// An orphaned toolUse stop (no tool_use block) corrupts Anthropic history:
-				// a later tool_result has nothing to anchor to. Thinking alone cannot anchor
-				// a tool_result, so it does not rescue a toolUse stop here.
-				for (const content of assistantMessage.content) {
-					if (content.type === "toolCall") return false;
-					if (content.type === "text" && hasNonWhitespace(content.text)) return false;
-				}
-				return true;
-			default:
-				return false;
-		}
 	}
 
 	#emptyStopRetryReminder(): string {
@@ -1294,14 +1335,25 @@ export class TurnRecovery {
 				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
 		const candidateSelector = formatModelStringWithRouting(candidate);
 		const previousModel = this.#host.model();
+		// Mark the chain unproven BEFORE the swap: `setModelWithProviderSessionReset`
+		// moves the model and fans `model_changed` out to subscribers synchronously,
+		// and a listener reading attribution in that window would see the incoming
+		// candidate carrying the previous one's proof. Restored on abort so a
+		// cancelled swap does not discard what the current model actually served.
+		const servedBeforeSwap = this.#activeRetryFallback?.served;
+		if (this.#activeRetryFallback) this.#activeRetryFallback.served = false;
 		await this.#host.setModelWithProviderSessionReset(candidate);
 		if (options?.signal?.aborted) {
+			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			if (previousModel && this.#host.model() === candidate) {
 				await this.#host.setModelWithProviderSessionReset(previousModel);
 			}
 			return false;
 		}
-		if (this.#host.model() !== candidate) return false;
+		if (this.#host.model() !== candidate) {
+			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
+			return false;
+		}
 		this.#host.sessionManager.appendModelChange(candidateSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
 		this.#host.settings.getStorage()?.recordModelUsage(candidateSelector);
 		this.#host.setThinkingLevel(nextThinkingLevel);
@@ -1475,11 +1527,15 @@ export class TurnRecovery {
 		const thinkingToApply =
 			currentThinkingLevel === lastAppliedFallbackThinkingLevel ? originalThinkingLevel : currentThinkingLevel;
 		const primarySelector = formatModelStringWithRouting(primaryModel);
+		// Clear before the swap: `setModelWithProviderSessionReset` and
+		// `setThinkingLevel` both notify subscribers, and an observer reading
+		// attribution in that window would see the restored primary still tagged
+		// as fallback-served.
+		this.clearActiveRetryFallback();
 		await this.#host.setModelWithProviderSessionReset(primaryModel);
 		this.#host.sessionManager.appendModelChange(primarySelector, EPHEMERAL_MODEL_CHANGE_ROLE);
 		this.#host.settings.getStorage()?.recordModelUsage(primarySelector);
 		this.#host.setThinkingLevel(thinkingToApply);
-		this.clearActiveRetryFallback();
 	}
 
 	#parseRetryAfterMsFromError(errorMessage: string): number | undefined {

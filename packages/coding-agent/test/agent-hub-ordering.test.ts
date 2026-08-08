@@ -442,14 +442,63 @@ describe("Agent hub row ordering", () => {
 		}
 	});
 
+	it("reads a live row's model off the session's served attribution, not its current pointer", () => {
+		geometry = stubStdoutGeometry(120);
+		const agents = new AgentRegistry();
+		// The main session has no executor progress and no persisted history, so
+		// its row comes straight off the live session. With a fallback armed but
+		// unproven, `model` already points at the candidate that has produced
+		// nothing — reporting it credits the run to a model that never spoke.
+		const session = {
+			model: { id: "gpt-5.6-sol", thinking: true },
+			thinkingLevel: "high",
+			servingModel: { selector: "anthropic/claude-sonnet-5", isFallback: false },
+		} as unknown as AgentSession;
+		agents.register({ id: "MainAgent", displayName: "Main Agent", kind: "sub", session });
+
+		const hub = makeHub(agents, { observers: new SessionObserverRegistry() });
+
+		try {
+			const rendered = Bun.stripANSI(hub.render(120).join("\n"));
+			expect(rendered).toContain("claude-sonnet-5");
+			expect(rendered).not.toContain("gpt-5.6-sol");
+			expect(rendered).not.toContain("fallback →");
+		} finally {
+			hub.dispose();
+		}
+	});
+
+	it("marks an armed fallback that has served nothing yet", () => {
+		geometry = stubStdoutGeometry(120);
+		const agents = new AgentRegistry();
+		// Nothing has served in this session, so there is no earlier work to
+		// miscredit — but the row must still say the model was reached by a
+		// fallback rather than presenting it as the plain configured model.
+		const session = {
+			model: { id: "gpt-5.6-sol", thinking: true },
+			thinkingLevel: "high",
+			servingModel: undefined,
+			pendingRetryFallbackModel: "openai-codex/gpt-5.6-sol",
+		} as unknown as AgentSession;
+		agents.register({ id: "UnprovenAgent", displayName: "Unproven Agent", kind: "sub", session });
+
+		const hub = makeHub(agents, { observers: new SessionObserverRegistry() });
+
+		try {
+			expect(Bun.stripANSI(hub.render(120).join("\n"))).toContain("fallback → openai-codex/gpt-5.6-sol");
+		} finally {
+			hub.dispose();
+		}
+	});
+
 	it("flags a fallback badge for a live row whose fallback armed no session retry state", () => {
 		geometry = stubStdoutGeometry(120);
 		const agents = new AgentRegistry();
-		// Live session with a resolved model but no `retryFallbackModel` — the
+		// Live session with a resolved model but no served fallback — the
 		// Fireworks Fast → base degrade emits `retry_fallback_applied` without
 		// arming `#activeRetryFallback`, so the badge must fall back to the
 		// executor-reported progress flag.
-		const session = { model: { id: "kimi-k2" }, retryFallbackModel: undefined } as unknown as AgentSession;
+		const session = { model: { id: "kimi-k2" }, servingModel: undefined } as unknown as AgentSession;
 		agents.register({ id: "FastAgent", displayName: "Fast Agent", kind: "sub", session });
 
 		const observers = new SessionObserverRegistry();
