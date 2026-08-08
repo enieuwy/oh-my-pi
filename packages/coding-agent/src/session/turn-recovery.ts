@@ -189,16 +189,17 @@ export class TurnRecovery {
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#acceptTerminalEmptyStopForPrompt = false;
-	/** Attribution of the newest turn that produced output, held across unproven switches. */
+	/** Attribution of the newest turn that produced output. */
 	#lastServedModel: ServingModel | undefined;
-	/** Memoized {@link servingModel}, keyed by the inputs that shape its selector. */
-	#servingModelCache:
-		| {
-				model: Model;
-				level: ThinkingLevel | undefined;
-				fallback: ActiveRetryFallbackState | undefined;
-				value: ServingModel;
-		  }
+	/**
+	 * Whether the current model was reached by fallback routing rather than by
+	 * the configured primary. Tracked separately from {@link #activeRetryFallback}
+	 * because the Fireworks Fast degrade swaps models without arming a chain.
+	 */
+	#fallbackRouted = false;
+	/** Memoized bootstrap answer, for the window before anything has served. */
+	#bootstrapCache:
+		| { model: Model; level: ThinkingLevel | undefined; routed: boolean; value: ServingModel }
 		| undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
@@ -208,13 +209,8 @@ export class TurnRecovery {
 				...options.initialRetryFallback,
 				lastAppliedFallbackThinkingLevel: host.configuredThinkingLevel(),
 				pinned: options.initialRetryFallback.pinned ?? false,
-				// Selected before this session ran, so on a fresh session it owns
-				// every turn from the first request and there is no earlier model's
-				// work to misattribute. A RESUMED transcript already holds turns some
-				// other model produced, so there the candidate stays unproven until
-				// it answers here.
-				served: !host.agent.state.messages.some(message => message.role === "assistant"),
 			};
+			this.#fallbackRouted = true;
 		}
 		this.#validateRetryFallbackChains();
 	}
@@ -233,31 +229,37 @@ export class TurnRecovery {
 	 * Model this session's produced work is attributed to.
 	 *
 	 * A model switch is a routing decision, not evidence the target can produce
-	 * anything. A fallback candidate that errors on its first request — an
-	 * exhausted quota, a hard provider error — produced none of the turns already
-	 * in this session, so while one is armed and unproven the answer stays with
-	 * the model that last actually served. Observers that reported the current
-	 * model instead credited a whole run to a model that never spoke.
+	 * anything: a candidate that errors on its first request produced none of the
+	 * turns already in this session. So attribution only ever names a model that
+	 * has settled a turn here, and a switch — into a fallback, back to a restored
+	 * primary, or anywhere else — moves it only once the new model answers.
+	 *
+	 * Before anything has served there is no earlier work to miscredit, so the
+	 * configured model is both the only available answer and a safe one.
 	 */
 	get servingModel(): ServingModel | undefined {
+		if (this.#lastServedModel) return this.#lastServedModel;
 		const model = this.#host.model();
-		if (!model) return this.#lastServedModel;
-		const fallback = this.#activeRetryFallback;
-		if (fallback && !fallback.served) return this.#lastServedModel;
-		// Observers poll this per streaming event and per render; formatting a
-		// selector each time would allocate on the hot path. Inputs are compared
-		// by identity and value, so a steady session reuses one object.
+		if (!model) return undefined;
+		// Polled per streaming event and per render, so the pre-first-turn window
+		// must not format a selector on every call.
 		const level = this.#host.thinkingLevel();
-		const cached = this.#servingModelCache;
-		if (cached && cached.model === model && cached.level === level && cached.fallback === fallback) {
+		const cached = this.#bootstrapCache;
+		if (cached && cached.model === model && cached.level === level && cached.routed === this.#fallbackRouted) {
 			return cached.value;
 		}
 		const value: ServingModel = {
 			selector: formatRetryFallbackSelector(model, level),
-			isFallback: fallback !== undefined,
+			isFallback: this.#fallbackRouted,
 		};
-		this.#servingModelCache = { model, level, fallback, value };
+		this.#bootstrapCache = { model, level, routed: this.#fallbackRouted, value };
 		return value;
+	}
+
+	/** Forgets attribution when the session's transcript is replaced wholesale. */
+	resetServedAttribution(): void {
+		this.#lastServedModel = undefined;
+		this.#bootstrapCache = undefined;
 	}
 
 	/**
@@ -298,7 +300,7 @@ export class TurnRecovery {
 		if (model) {
 			this.#lastServedModel = {
 				selector: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
-				isFallback: this.#activeRetryFallback !== undefined,
+				isFallback: this.#fallbackRouted,
 			};
 		}
 		// Independent of the retry saga below: a usage-aware fallback is applied
@@ -1092,9 +1094,10 @@ export class TurnRecovery {
 		return getRetryFallbackRevertPolicy(this.#host.settings);
 	}
 
-	/** Clears fallback ownership after an explicit model change. */
+	/** Clears fallback ownership after an explicit model change or a restore. */
 	clearActiveRetryFallback(): void {
 		this.#activeRetryFallback = undefined;
+		this.#fallbackRouted = false;
 	}
 
 	/** Checks whether a fallback selector remains in cooldown. */
@@ -1335,15 +1338,18 @@ export class TurnRecovery {
 				: clampThinkingLevelToCeiling(candidate, requestedThinkingLevel, this.#host.thinkingLevelCeiling());
 		const candidateSelector = formatModelStringWithRouting(candidate);
 		const previousModel = this.#host.model();
-		// Mark the chain unproven BEFORE the swap: `setModelWithProviderSessionReset`
-		// moves the model and fans `model_changed` out to subscribers synchronously,
-		// and a listener reading attribution in that window would see the incoming
-		// candidate carrying the previous one's proof. Restored on abort so a
-		// cancelled swap does not discard what the current model actually served.
+		// Mark routing BEFORE the swap: `setModelWithProviderSessionReset` moves the
+		// model and fans `model_changed` out to subscribers synchronously, and a
+		// listener reading attribution in that window must already see the incoming
+		// candidate as fallback-routed. Attribution itself is safe regardless — it
+		// names the last model that served, which this swap has not changed.
+		const routedBeforeSwap = this.#fallbackRouted;
 		const servedBeforeSwap = this.#activeRetryFallback?.served;
+		this.#fallbackRouted = true;
 		if (this.#activeRetryFallback) this.#activeRetryFallback.served = false;
 		await this.#host.setModelWithProviderSessionReset(candidate);
 		if (options?.signal?.aborted) {
+			this.#fallbackRouted = routedBeforeSwap;
 			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			if (previousModel && this.#host.model() === candidate) {
 				await this.#host.setModelWithProviderSessionReset(previousModel);
@@ -1351,6 +1357,7 @@ export class TurnRecovery {
 			return false;
 		}
 		if (this.#host.model() !== candidate) {
+			this.#fallbackRouted = routedBeforeSwap;
 			if (this.#activeRetryFallback) this.#activeRetryFallback.served = servedBeforeSwap;
 			return false;
 		}
@@ -1473,6 +1480,9 @@ export class TurnRecovery {
 		const apiKey = await this.#host.modelRegistry.getApiKey(baseModel, this.#host.sessionId());
 		if (!apiKey) return false;
 		const baseSelector = formatModelStringWithRouting(baseModel);
+		// A capability degrade is fallback routing too, even though it arms no
+		// chain: the base model must not be reported as the configured primary.
+		this.#fallbackRouted = true;
 		await this.#host.setModelWithProviderSessionReset(baseModel);
 		this.#host.sessionManager.appendModelChange(baseSelector, EPHEMERAL_MODEL_CHANGE_ROLE, true);
 		this.#host.settings.getStorage()?.recordModelUsage(baseSelector);

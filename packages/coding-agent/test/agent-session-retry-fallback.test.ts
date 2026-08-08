@@ -1278,9 +1278,13 @@ describe("AgentSession retry fallback", () => {
 				role: "slow",
 			},
 		]);
-		// Advancing the chain makes it unproven again: the abandoned candidate
-		// never served, so at the swap there is nothing to attribute yet.
-		expect(servingAtSwap).toBeUndefined();
+		// Nothing had served when the chain advanced, so there was no earlier work
+		// to miscredit and the candidate being attempted is the only answer — but
+		// it is still reported as fallback-routed.
+		expect(servingAtSwap).toEqual({
+			selector: `${secondFallback.provider}/${secondFallback.id}`,
+			isFallback: true,
+		});
 		expect(session.servingModel).toEqual({
 			selector: `${secondFallback.provider}/${secondFallback.id}`,
 			isFallback: true,
@@ -3412,6 +3416,123 @@ describe("AgentSession retry fallback", () => {
 		]);
 		expect(session.model?.provider).toBe(primaryModel.provider);
 		expect(session.model?.id).toBe(primaryModel.id);
+		// The restored primary answered, so attribution moves back with it.
+		expect(session.servingModel).toEqual({
+			selector: `${primaryModel.provider}/${primaryModel.id}`,
+			isFallback: false,
+		});
+	});
+
+	it("keeps credit with the fallback when a restored primary fails without serving", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primaryModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				// Only the fallback ever produces anything; the primary rate-limits on
+				// every request, including after its cooldown expires and it is
+				// restored. `retry-after-ms` keeps the cooldown short enough to expire
+				// within the test's clock jump.
+				mock.push(
+					model.id === fallbackModel.id
+						? { content: ["the fallback did the work"] }
+						: { throw: "rate limit exceeded retry-after-ms=200" },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 2,
+			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
+			"retry.fallbackRevertPolicy": "cooldown-expiry",
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		let now = Date.now();
+		vi.spyOn(Date, "now").mockImplementation(() => now);
+
+		await session.prompt("Fail over to the fallback");
+		await session.waitForIdle();
+		expect(session.servingModel).toEqual({
+			selector: `${fallbackModel.provider}/${fallbackModel.id}`,
+			isFallback: true,
+		});
+
+		// Capture attribution inside the restore's synchronous `model_changed`
+		// fan-out, which is the window the restore path reopens.
+		const servingDuringSwaps: Array<ServingModel | undefined> = [];
+		session.subscribe(event => {
+			if (event.type === "model_changed") servingDuringSwaps.push(session.servingModel);
+		});
+
+		now += 240;
+		await session.prompt("Cooldown expired: revert to the primary and fail there");
+		await session.waitForIdle();
+
+		// A restore is a routing decision like a fallback is: the primary produced
+		// nothing after coming back, so the work still belongs to the fallback.
+		expect(requestedModels).toContain(`${primaryModel.provider}/${primaryModel.id}`);
+		expect(servingDuringSwaps.length).toBeGreaterThan(0);
+		for (const serving of servingDuringSwaps) {
+			expect(serving?.selector).not.toBe(`${primaryModel.provider}/${primaryModel.id}`);
+		}
+	});
+
+	it("reports a Fireworks Fast degrade as fallback-routed even though it arms no chain", async () => {
+		const fastModel = getBundledModel("fireworks", "kimi-k2.6-fast");
+		if (!fastModel) throw new Error("Expected the bundled Fireworks Fast model to exist");
+		const baseId = fastModel.id.replace(/-fast$/, "");
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: fastModel, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				// Fast rejects the request; the base model answers it.
+				mock.push(
+					model.id === fastModel.id
+						? { throw: "rate limit exceeded retry-after-ms=200" }
+						: { content: ["the base model did the work"] },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({ "compaction.enabled": false, "retry.baseDelayMs": 5 });
+		settings.setModelRole("default", `${fastModel.provider}/${fastModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("Degrade off Fast and answer on the base model");
+		await session.waitForIdle();
+
+		// The degrade swaps models without arming a retry-fallback chain, but it is
+		// still fallback routing — a bare model badge would hide that.
+		expect(requestedModels).toEqual([`${fastModel.provider}/${fastModel.id}`, `fireworks/${baseId}`]);
+		expect(session.servingModel).toEqual({ selector: `fireworks/${baseId}`, isFallback: true });
 	});
 
 	it("restores routed fallback primaries after cooldown expiry", async () => {
