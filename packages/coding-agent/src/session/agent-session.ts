@@ -3988,11 +3988,6 @@ export class AgentSession {
 		return this.#recovery.servingModel;
 	}
 
-	/** Selector of a fallback that is armed but has not produced a turn yet. */
-	get pendingRetryFallbackModel(): string | undefined {
-		return this.#recovery.pendingRetryFallbackModel;
-	}
-
 	/** Install the interactive decision surface for reserve-triggered model changes. */
 	setUsageFallbackConfirmer(confirmer: UsageFallbackConfirmer | undefined): void {
 		this.#usageFallbackConfirmer = confirmer;

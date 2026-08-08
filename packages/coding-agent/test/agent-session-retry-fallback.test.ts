@@ -4119,10 +4119,11 @@ describe("AgentSession retry fallback", () => {
 			selector: `${primaryModel.provider}/${primaryModel.id}`,
 			isFallback: false,
 		});
-		// Attribution belongs to the transcript it was earned in. Switching the
-		// session in place drops it rather than carrying another session's model
-		// across, leaving only what this session currently points at.
-		vi.spyOn(session.sessionManager, "getSessionFile").mockReturnValue("/tmp/some-other-session.jsonl");
+		// Attribution belongs to the session it was earned in. Every real switch
+		// mints a new session id — including for an unpersisted session, which has
+		// no file to compare — so the stale value drops itself, leaving only what
+		// this session currently points at.
+		vi.spyOn(session.sessionManager, "getSessionId").mockReturnValue("some-other-session");
 		expect(session.servingModel).toEqual({
 			selector: `${fallbackModel.provider}/${fallbackModel.id}`,
 			isFallback: true,
@@ -4152,6 +4153,11 @@ describe("AgentSession retry fallback", () => {
 			modelRegistry,
 		});
 
+		// Observers poll this per streaming event and per render. Before anything
+		// has served the answer is computed rather than stored, so that is the
+		// window where a fresh allocation per call would show up.
+		expect(session.servingModel).toBe(session.servingModel);
+
 		await session.prompt("Fail over to a working fallback");
 		await session.waitForIdle();
 
@@ -4160,9 +4166,6 @@ describe("AgentSession retry fallback", () => {
 			selector: `${fallbackModel.provider}/${fallbackModel.id}`,
 			isFallback: true,
 		});
-		// Observers poll this per streaming event and per render, so a steady
-		// session must not allocate a fresh answer each time.
-		expect(session.servingModel).toBe(session.servingModel);
 	});
 
 	it("keeps attribution on a served fallback while the next candidate is unproven", async () => {

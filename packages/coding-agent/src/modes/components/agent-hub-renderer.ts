@@ -113,11 +113,7 @@ export function modelBadge(ref: AgentRef, observed: ObservableSession | undefine
 	const fallbackSelector =
 		(serving?.isFallback ? serving.selector : undefined) ??
 		(progress?.resolvedModelIsFallback ? progress.resolvedModel : undefined) ??
-		(ref.history?.resolvedModelIsFallback ? ref.history.resolvedModel : undefined) ??
-		// Nothing has served at all, so there is no earlier work to miscredit and
-		// the armed candidate is all there is to report — but it is still a
-		// fallback, and a bare model badge would hide that.
-		(serving ? undefined : ref.session?.pendingRetryFallbackModel);
+		(ref.history?.resolvedModelIsFallback ? ref.history.resolvedModel : undefined);
 	if (fallbackSelector) {
 		return `${theme.fg("warning", "fallback →")} ${formatResolvedModelBadge(fallbackSelector, true, liveThinkingLevel)}`;
 	}

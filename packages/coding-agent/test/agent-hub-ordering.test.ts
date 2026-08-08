@@ -477,8 +477,9 @@ describe("Agent hub row ordering", () => {
 		const session = {
 			model: { id: "gpt-5.6-sol", thinking: true },
 			thinkingLevel: "high",
-			servingModel: undefined,
-			pendingRetryFallbackModel: "openai-codex/gpt-5.6-sol",
+			// Nothing served, so the session names what it currently points at —
+			// still flagged as fallback-routed.
+			servingModel: { selector: "openai-codex/gpt-5.6-sol", isFallback: true },
 		} as unknown as AgentSession;
 		agents.register({ id: "UnprovenAgent", displayName: "Unproven Agent", kind: "sub", session });
 

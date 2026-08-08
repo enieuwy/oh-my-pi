@@ -189,14 +189,20 @@ export class TurnRecovery {
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#acceptTerminalEmptyStopForPrompt = false;
+	// Three fields sit near the word "serve" and are deliberately distinct:
+	// `#activeRetryFallback.served` gates the one-shot `retry_fallback_succeeded`
+	// event for the current arm, `#fallbackRouted` says how the CURRENT model was
+	// reached, and `#lastServed` is the session's attribution. A fallback flipping
+	// to served does not by itself move attribution — only a settled turn does.
 	/**
 	 * Attribution of the newest turn that produced output, tagged with the
-	 * transcript it belongs to. Anchoring rather than resetting follows
-	 * `#ensurePersistedMessageKeys`: switching sessions in place changes the
-	 * session file, so the stale attribution drops itself and no mutation call
-	 * site has to remember to clear it.
+	 * session it belongs to. Anchoring rather than resetting follows
+	 * `#ensurePersistedMessageKeys`: every real switch mints a new session id, so
+	 * stale attribution drops itself and no mutation call site has to remember to
+	 * clear it. The id — not the file — is the anchor because an unpersisted
+	 * session has no file, and comparing two `undefined`s would never invalidate.
 	 */
-	#lastServed: { attribution: ServingModel; sessionFile: string | undefined } | undefined;
+	#lastServed: { attribution: ServingModel; sessionId: string } | undefined;
 	/**
 	 * Whether the current model was reached by fallback routing rather than by
 	 * the configured primary. Tracked separately from {@link #activeRetryFallback}
@@ -245,7 +251,7 @@ export class TurnRecovery {
 	 */
 	get servingModel(): ServingModel | undefined {
 		const served = this.#lastServed;
-		if (served && served.sessionFile === this.#host.sessionManager.getSessionFile()) return served.attribution;
+		if (served && served.sessionId === this.#host.sessionManager.getSessionId()) return served.attribution;
 		const model = this.#host.model();
 		if (!model) return undefined;
 		// Polled per streaming event and per render, so the pre-first-turn window
@@ -261,19 +267,6 @@ export class TurnRecovery {
 		};
 		this.#bootstrapCache = { model, level, routed: this.#fallbackRouted, value };
 		return value;
-	}
-
-	/**
-	 * Selector of a fallback that is armed but has not served yet.
-	 *
-	 * Nothing has been attributed to it, so it is not the serving model — but
-	 * when the session has produced no output at all there is no earlier work to
-	 * miscredit, and naming it is the only honest thing an observer can show.
-	 */
-	get pendingRetryFallbackModel(): string | undefined {
-		const model = this.#host.model();
-		if (!model || !this.#activeRetryFallback || this.#activeRetryFallback.served) return undefined;
-		return formatRetryFallbackSelector(model, this.#host.thinkingLevel());
 	}
 
 	/** Resets per-prompt recovery counters and terminal-stop acceptance. */
@@ -304,7 +297,7 @@ export class TurnRecovery {
 					selector: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
 					isFallback: this.#fallbackRouted,
 				},
-				sessionFile: this.#host.sessionManager.getSessionFile(),
+				sessionId: this.#host.sessionManager.getSessionId(),
 			};
 		}
 		// Independent of the retry saga below: a usage-aware fallback is applied
@@ -1512,7 +1505,12 @@ export class TurnRecovery {
 		} = this.#activeRetryFallback;
 		const originalSelector = parseRetryFallbackSelector(originalSelectorRaw, this.#host.modelRegistry);
 		if (!originalSelector) {
-			this.clearActiveRetryFallback();
+			// Defensive: the stored selector is always produced by
+			// `formatRetryFallbackSelector`, so it should never fail to parse. If it
+			// somehow does, nothing is restored and the session keeps running on the
+			// fallback — so drop the chain record but NOT `#fallbackRouted`, whose
+			// clearing would report the fallback's remaining turns as the primary.
+			this.#activeRetryFallback = undefined;
 			return;
 		}
 
