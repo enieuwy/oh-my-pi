@@ -4119,6 +4119,14 @@ describe("AgentSession retry fallback", () => {
 			selector: `${primaryModel.provider}/${primaryModel.id}`,
 			isFallback: false,
 		});
+		// Attribution belongs to the transcript it was earned in. Switching the
+		// session in place drops it rather than carrying another session's model
+		// across, leaving only what this session currently points at.
+		vi.spyOn(session.sessionManager, "getSessionFile").mockReturnValue("/tmp/some-other-session.jsonl");
+		expect(session.servingModel).toEqual({
+			selector: `${fallbackModel.provider}/${fallbackModel.id}`,
+			isFallback: true,
+		});
 	});
 
 	it("reports the fallback selector once the target serves a turn", async () => {

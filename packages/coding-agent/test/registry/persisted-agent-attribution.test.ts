@@ -190,20 +190,20 @@ describe("persisted agent model attribution", () => {
 		expect(history?.resolvedModelIsFallback).toBe(true);
 	});
 
-	it("matches a served model to a transition decorated with routing and thinking suffixes", async () => {
+	it("matches a served model to a transition carrying a gateway route", async () => {
 		using tempDir = TempDir.createSync("@omp-attribution-routed-");
-		// Records store the selector through `formatModelStringWithRouting`, which
-		// appends an `@upstream` gateway route and a `:level` suffix the raw
-		// message never carries. Failing to match drops the fallback flag.
+		// Writers record the selector through `formatModelStringWithRouting`, which
+		// appends an `@upstream` gateway route the raw message never carries.
+		// Failing to match drops the fallback flag.
 		const registry = await historyFor(tempDir.path(), "Routed", [
 			...transcriptHead(),
 			assistant("e1", "si", SONNET, "error", []),
-			modelChange("m2", "e1", "openai-codex/gpt-5.6-sol@vercel-gw:high", "fallback", true),
+			modelChange("m2", "e1", "openai-codex/gpt-5.6-sol@vercel-gw", "fallback", true),
 			assistant("a1", "m2", SOL, "stop", [{ type: "text", text: "served via the gateway" }]),
 		]);
 
 		const history = registry.get("Routed")?.history;
-		expect(history?.resolvedModel).toBe("openai-codex/gpt-5.6-sol@vercel-gw:high");
+		expect(history?.resolvedModel).toBe("openai-codex/gpt-5.6-sol@vercel-gw");
 		expect(history?.resolvedModelIsFallback).toBe(true);
 	});
 });

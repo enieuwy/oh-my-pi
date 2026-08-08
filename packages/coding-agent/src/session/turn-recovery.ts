@@ -189,8 +189,14 @@ export class TurnRecovery {
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#acceptTerminalEmptyStopForPrompt = false;
-	/** Attribution of the newest turn that produced output. */
-	#lastServedModel: ServingModel | undefined;
+	/**
+	 * Attribution of the newest turn that produced output, tagged with the
+	 * transcript it belongs to. Anchoring rather than resetting follows
+	 * `#ensurePersistedMessageKeys`: switching sessions in place changes the
+	 * session file, so the stale attribution drops itself and no mutation call
+	 * site has to remember to clear it.
+	 */
+	#lastServed: { attribution: ServingModel; sessionFile: string | undefined } | undefined;
 	/**
 	 * Whether the current model was reached by fallback routing rather than by
 	 * the configured primary. Tracked separately from {@link #activeRetryFallback}
@@ -238,7 +244,8 @@ export class TurnRecovery {
 	 * configured model is both the only available answer and a safe one.
 	 */
 	get servingModel(): ServingModel | undefined {
-		if (this.#lastServedModel) return this.#lastServedModel;
+		const served = this.#lastServed;
+		if (served && served.sessionFile === this.#host.sessionManager.getSessionFile()) return served.attribution;
 		const model = this.#host.model();
 		if (!model) return undefined;
 		// Polled per streaming event and per render, so the pre-first-turn window
@@ -254,12 +261,6 @@ export class TurnRecovery {
 		};
 		this.#bootstrapCache = { model, level, routed: this.#fallbackRouted, value };
 		return value;
-	}
-
-	/** Forgets attribution when the session's transcript is replaced wholesale. */
-	resetServedAttribution(): void {
-		this.#lastServedModel = undefined;
-		this.#bootstrapCache = undefined;
 	}
 
 	/**
@@ -298,9 +299,12 @@ export class TurnRecovery {
 		}
 		const model = this.#host.model();
 		if (model) {
-			this.#lastServedModel = {
-				selector: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
-				isFallback: this.#fallbackRouted,
+			this.#lastServed = {
+				attribution: {
+					selector: formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+					isFallback: this.#fallbackRouted,
+				},
+				sessionFile: this.#host.sessionManager.getSessionFile(),
 			};
 		}
 		// Independent of the retry saga below: a usage-aware fallback is applied
@@ -311,7 +315,8 @@ export class TurnRecovery {
 			this.#activeRetryFallback.served = true;
 			await this.#host.emitSessionEvent({
 				type: "retry_fallback_succeeded",
-				model: this.#lastServedModel?.selector ?? formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
+				model:
+					this.#lastServed?.attribution.selector ?? formatRetryFallbackSelector(model, this.#host.thinkingLevel()),
 				role: this.#activeRetryFallback.role,
 			});
 		}

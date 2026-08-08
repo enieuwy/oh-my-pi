@@ -191,16 +191,13 @@ async function readPersistedAgentHistory(
 				modelRole ??= modelChange.role;
 			}
 			// The transition that installed the serving model: it carries the
-			// fallback flag and the decorations the raw message lacks. A record's
-			// selector is written through `formatModelStringWithRouting`, so the
-			// bare `provider/model` from the message may be suffixed with an
-			// `@upstream` gateway route and/or a `:level` thinking suffix.
+			// fallback flag the raw message lacks. Every writer records the selector
+			// through `formatModelStringWithRouting`, which appends an `@upstream`
+			// gateway route the message's bare `provider/model` never has.
 			if (
 				servedModel !== undefined &&
 				resolvedModel === undefined &&
-				(modelChange.model === servedModel ||
-					modelChange.model.startsWith(`${servedModel}:`) ||
-					modelChange.model.startsWith(`${servedModel}@`))
+				(modelChange.model === servedModel || modelChange.model.startsWith(`${servedModel}@`))
 			) {
 				resolvedModel = modelChange.model;
 				resolvedModelIsFallback = modelChange.resolvedModelIsFallback;
