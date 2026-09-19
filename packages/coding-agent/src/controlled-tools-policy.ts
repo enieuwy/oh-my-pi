@@ -1,7 +1,8 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createMCPToolName } from "./mcp/tool-name";
 
-export const CONTROLLED_TOOLS_POLICY_VERSION = 1 as const;
+export const CONTROLLED_TOOLS_POLICY_VERSION = 2 as const;
 export const CONTROLLED_TOOLS_CAPABILITIES = {
 	version: 1,
 	policy_version: CONTROLLED_TOOLS_POLICY_VERSION,
@@ -13,6 +14,15 @@ const MAX_LIST_ITEMS = 256;
 const MAX_STRING_BYTES = 4096;
 const TOOL_NAME_RE = /^(?:xd:\/\/)?[a-z][a-z0-9_]*$/;
 const MCP_SERVER_NAME_RE = /^[a-zA-Z0-9_.:-]+$/;
+const CONTROLLED_POLICY_FIELDS: Record<string, true> = {
+	version: true,
+	tools: true,
+	native_tools: true,
+	extensions: true,
+	model: true,
+	mcp_tools: true,
+	subprocess_argv: true,
+};
 const FORBIDDEN_NATIVE_TOOLS: Record<string, true> = {
 	bash: true,
 	task: true,
@@ -23,12 +33,12 @@ const FORBIDDEN_NATIVE_TOOLS: Record<string, true> = {
 };
 
 export interface ControlledToolsPolicy {
-	readonly version: 1;
+	readonly version: 2;
 	readonly tools: readonly string[];
 	readonly native_tools: readonly string[];
 	readonly extensions: readonly string[];
 	readonly model: string;
-	readonly mcp_servers: readonly string[];
+	readonly mcp_tools: Readonly<Record<string, readonly string[]>>;
 	readonly subprocess_argv: readonly string[];
 }
 
@@ -47,10 +57,9 @@ function policyError(message: string): Error {
 function assertClosedObject(value: unknown): Record<string, unknown> {
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw policyError("expected a JSON object");
 	const record = value as Record<string, unknown>;
-	const allowed = new Set(["version", "tools", "native_tools", "extensions", "model", "mcp_servers", "subprocess_argv"]);
-	const unknown = Object.keys(record).filter(key => !allowed.has(key));
+	const unknown = Object.keys(record).filter(key => !Object.hasOwn(CONTROLLED_POLICY_FIELDS, key));
 	if (unknown.length > 0) throw policyError(`unknown field${unknown.length === 1 ? "" : "s"}: ${unknown.join(", ")}`);
-	for (const key of allowed) {
+	for (const key of Object.keys(CONTROLLED_POLICY_FIELDS)) {
 		if (!Object.hasOwn(record, key)) throw policyError(`missing field: ${key}`);
 	}
 	return record;
@@ -62,7 +71,12 @@ function parseStringList(value: unknown, field: string, pattern?: RegExp): strin
 	const result: string[] = [];
 	const seen = new Set<string>();
 	for (const item of value) {
-		if (typeof item !== "string" || item.length === 0 || Buffer.byteLength(item) > MAX_STRING_BYTES || item.includes("\0")) {
+		if (
+			typeof item !== "string" ||
+			item.length === 0 ||
+			Buffer.byteLength(item) > MAX_STRING_BYTES ||
+			item.includes("\0")
+		) {
 			throw policyError(`${field} entries must be non-empty bounded strings`);
 		}
 		if (pattern && !pattern.test(item)) throw policyError(`${field} contains an invalid name: ${item}`);
@@ -72,6 +86,27 @@ function parseStringList(value: unknown, field: string, pattern?: RegExp): strin
 	}
 	return result;
 }
+
+function parseMCPTools(value: unknown): Readonly<Record<string, readonly string[]>> {
+	if (!value || typeof value !== "object" || Array.isArray(value)) {
+		throw policyError("mcp_tools must be an object");
+	}
+	const entries = Object.entries(value as Record<string, unknown>);
+	if (entries.length > MAX_LIST_ITEMS) throw policyError(`mcp_tools exceeds ${MAX_LIST_ITEMS} servers`);
+	const result: Record<string, readonly string[]> = Object.create(null) as Record<string, readonly string[]>;
+	for (const [serverName, rawTools] of entries) {
+		if (
+			serverName.length === 0 ||
+			Buffer.byteLength(serverName) > MAX_STRING_BYTES ||
+			serverName.includes("\0") ||
+			!MCP_SERVER_NAME_RE.test(serverName)
+		) {
+			throw policyError(`mcp_tools contains an invalid server name: ${serverName}`);
+		}
+		result[serverName] = Object.freeze(parseStringList(rawTools, `mcp_tools.${serverName}`));
+	}
+	return Object.freeze(result);
+}
 /** Convert direct and xd:// spellings to one registry name. */
 export function canonicalControlledToolName(name: string): string {
 	return name.startsWith("xd://") ? name.slice("xd://".length) : name;
@@ -79,9 +114,12 @@ export function canonicalControlledToolName(name: string): string {
 
 /** Return the exact canonical registry ceiling for a policy. */
 export function controlledPolicyCanonicalToolNames(policy: ControlledToolsPolicy): string[] {
-	return policy.tools.map(canonicalControlledToolName);
+	const names = policy.tools.map(canonicalControlledToolName);
+	for (const [serverName, rawToolNames] of Object.entries(policy.mcp_tools)) {
+		for (const rawToolName of rawToolNames) names.push(createMCPToolName(serverName, rawToolName));
+	}
+	return names;
 }
-
 
 function assertNormalFile(filePath: string, field: string, executable = false): string {
 	if (!path.isAbsolute(filePath)) throw policyError(`${field} must be absolute: ${filePath}`);
@@ -89,9 +127,12 @@ function assertNormalFile(filePath: string, field: string, executable = false): 
 	try {
 		stat = fs.lstatSync(filePath);
 	} catch (error) {
-		throw policyError(`${field} is unavailable: ${filePath} (${error instanceof Error ? error.message : String(error)})`);
+		throw policyError(
+			`${field} is unavailable: ${filePath} (${error instanceof Error ? error.message : String(error)})`,
+		);
 	}
-	if (stat.isSymbolicLink() || !stat.isFile()) throw policyError(`${field} must name a regular non-symlink file: ${filePath}`);
+	if (stat.isSymbolicLink() || !stat.isFile())
+		throw policyError(`${field} must name a regular non-symlink file: ${filePath}`);
 	if (executable) {
 		try {
 			fs.accessSync(filePath, fs.constants.X_OK);
@@ -112,6 +153,9 @@ export function parseControlledToolsPolicy(value: unknown): ControlledToolsPolic
 	const toolSet = new Set(canonicalTools);
 	if (toolSet.size !== tools.length) {
 		throw policyError("tools cannot contain direct and xd:// spellings of the same canonical name");
+	}
+	if (canonicalTools.some(name => name.startsWith("mcp__"))) {
+		throw policyError("tools must exclude MCP tool names; grant them through mcp_tools");
 	}
 	const nativeTools = parseStringList(record.native_tools, "native_tools", TOOL_NAME_RE);
 	for (const name of nativeTools) {
@@ -134,7 +178,23 @@ export function parseControlledToolsPolicy(value: unknown): ControlledToolsPolic
 	) {
 		throw policyError("model must be an exact provider/model id");
 	}
-	const mcpServers = parseStringList(record.mcp_servers, "mcp_servers", MCP_SERVER_NAME_RE);
+	const mcpTools = parseMCPTools(record.mcp_tools);
+	const canonicalOwners = new Map<string, string>();
+	for (let index = 0; index < canonicalTools.length; index++) {
+		canonicalOwners.set(canonicalTools[index]!, `tools entry ${tools[index]}`);
+	}
+	for (const [serverName, rawToolNames] of Object.entries(mcpTools)) {
+		for (const rawToolName of rawToolNames) {
+			const canonicalName = createMCPToolName(serverName, rawToolName);
+			const owner = canonicalOwners.get(canonicalName);
+			if (owner) {
+				throw policyError(
+					`canonical tool name collision at ${canonicalName}: ${owner} and mcp_tools.${serverName} entry ${rawToolName}`,
+				);
+			}
+			canonicalOwners.set(canonicalName, `mcp_tools.${serverName} entry ${rawToolName}`);
+		}
+	}
 	const subprocessArgv = parseStringList(record.subprocess_argv, "subprocess_argv");
 	if (subprocessArgv.length > 0) assertNormalFile(subprocessArgv[0], "subprocess_argv[0]", true);
 	if (nativeTools.includes("lsp") && subprocessArgv.length === 0) {
@@ -146,7 +206,7 @@ export function parseControlledToolsPolicy(value: unknown): ControlledToolsPolic
 		native_tools: Object.freeze(nativeTools),
 		extensions: Object.freeze(extensions),
 		model,
-		mcp_servers: Object.freeze(mcpServers),
+		mcp_tools: mcpTools,
 		subprocess_argv: Object.freeze(subprocessArgv),
 	});
 }

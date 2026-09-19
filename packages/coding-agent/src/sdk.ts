@@ -1319,14 +1319,16 @@ export function createAutoLearnCaptureRunner(
  */
 class ControlledToolRegistry extends Map<string, Tool & Pick<ToolDefinition, "defaultInactive">> {
 	readonly #allowed: ReadonlySet<string>;
+	readonly #allowedNonMCP: ReadonlySet<string>;
 
-	constructor(allowed: Iterable<string>) {
+	constructor(allowed: Iterable<string>, allowedNonMCP: Iterable<string>) {
 		super();
 		this.#allowed = new Set(allowed);
+		this.#allowedNonMCP = new Set(allowedNonMCP);
 	}
 
 	override set(name: string, tool: Tool & Pick<ToolDefinition, "defaultInactive">): this {
-		if (!this.#allowed.has(name)) {
+		if (!this.#allowed.has(name) || (!this.#allowedNonMCP.has(name) && getMCPToolOriginKey(tool) === undefined)) {
 			throw new Error(`Controlled tool policy refused unlisted tool registration: ${name}`);
 		}
 		return super.set(name, tool);
@@ -1348,7 +1350,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		if ((options.extensions?.length ?? 0) > 0) {
 			throw new Error("Controlled startup cannot load inline extension factories");
 		}
-		const expectedPaths = new Set(controlledPolicy.extensions.map(extensionPath => fs.realpathSync.native(extensionPath)));
+		const expectedPaths = new Set(
+			controlledPolicy.extensions.map(extensionPath => fs.realpathSync.native(extensionPath)),
+		);
 		const suppliedPaths = new Set<string>();
 		for (const extensionPath of options.additionalExtensionPaths ?? [])
 			suppliedPaths.add(fs.realpathSync.native(extensionPath));
@@ -1845,8 +1849,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const fileMutationVersions = new Map<string, number>();
 		const disposeCallbacks = new Set<() => void>();
 		const controlledToolNames = controlledPolicy ? controlledPolicyCanonicalToolNames(controlledPolicy) : undefined;
+		const controlledMCPServerNames = controlledPolicy ? Object.keys(controlledPolicy.mcp_tools) : undefined;
+		const controlledNonMCPToolNames = controlledPolicy
+			? new Set(controlledPolicy.tools.map(canonicalControlledToolName))
+			: undefined;
 		const toolRegistry: Map<string, Tool & Pick<ToolDefinition, "defaultInactive">> = controlledPolicy
-			? new ControlledToolRegistry(controlledToolNames ?? [])
+			? new ControlledToolRegistry(controlledToolNames ?? [], controlledNonMCPToolNames ?? [])
 			: new Map();
 		const activeToolNames = new Set<string>();
 		const setActiveToolNames = (names: Iterable<string>): void => {
@@ -2054,7 +2062,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			evalActive: activeToolNames.has("eval"),
 		});
 		const enableMCP =
-			!restrictToolNames && (controlledPolicy ? controlledPolicy.mcp_servers.length > 0 : (options.enableMCP ?? true));
+			!restrictToolNames &&
+			(controlledMCPServerNames ? controlledMCPServerNames.length > 0 : (options.enableMCP ?? true));
 		let mcpManager: MCPManager | undefined = enableMCP ? options.mcpManager : undefined;
 		toolSession.mcpManager = mcpManager;
 		toolSession.enableMCP = enableMCP;
@@ -2087,10 +2096,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			// Filter browser MCP only when Eval can expose the built-in browser prelude.
 			filterBrowser: initialBrowserPreludeAvailable,
 			extensionRoots: controlledPolicy
-				? ({ explicit: [], mode: "explicit-only", configured: [], configuredLevel: "user" } as EffectiveExtensionRoots)
+				? ({
+						explicit: [],
+						mode: "explicit-only",
+						configured: [],
+						configuredLevel: "user",
+					} as EffectiveExtensionRoots)
 				: buildSessionExtensionRoots(),
 			configCwd: controlledPolicy ? controlledConfigCwd : undefined,
-			serverNames: controlledPolicy ? controlledPolicy.mcp_servers : undefined,
+			serverNames: controlledMCPServerNames,
 			toolNameCeiling: controlledToolNames ? new Set(controlledToolNames) : undefined,
 			onlyUserConfig: controlledPolicy !== undefined,
 		};
@@ -3001,7 +3015,15 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				nativeToolsByName.set(goalTool.name, wrapped);
 			}
 		}
+		const controlledExtensionToolNames = controlledPolicy ? new Set<string>() : undefined;
 		for (const tool of wrappedExtensionTools) {
+			if (controlledPolicy?.native_tools.includes(tool.name)) {
+				throw new Error(`Controlled tool name collision between native and extension registrations: ${tool.name}`);
+			}
+			if (controlledExtensionToolNames?.has(tool.name)) {
+				throw new Error(`Controlled tool name collision between extension registrations: ${tool.name}`);
+			}
+			controlledExtensionToolNames?.add(tool.name);
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.delete(tool.name);
 		}
@@ -3021,7 +3043,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			}
 		}
 		if (controlledPolicy) {
-			const missingTools = controlledPolicy.tools.filter(name => !toolRegistry.has(canonicalControlledToolName(name)));
+			const missingTools = (controlledToolNames ?? []).filter(name => !toolRegistry.has(name));
 			if (missingTools.length > 0) {
 				throw new Error(`Controlled tools unavailable: ${missingTools.join(", ")}`);
 			}
@@ -3633,9 +3655,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const settingsAwareStreamFn: StreamFn = controlledPolicy
 			? (requestedModel, context, streamOptions) => {
 					if (`${requestedModel.provider}/${requestedModel.id}` !== controlledPolicy.model) {
-						throw new Error(
-							`Controlled model switch refused: ${requestedModel.provider}/${requestedModel.id}`,
-						);
+						throw new Error(`Controlled model switch refused: ${requestedModel.provider}/${requestedModel.id}`);
 					}
 					return unguardedSettingsAwareStreamFn(requestedModel, context, streamOptions);
 				}
@@ -3885,12 +3905,13 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			modelRegistry,
 			rebindModelAfterDiscovery: options.model === undefined || options.rebindModelAfterDiscovery === true,
 			toolRegistry,
-			reconcileBrowserMcpFilter: mcpManager && !controlledPolicy
-				? async enabled => {
-						await mcpManager.reconcileBrowserFilter(enabled);
-						return mcpManager.getTools();
-					}
-				: undefined,
+			reconcileBrowserMcpFilter:
+				mcpManager && !controlledPolicy
+					? async enabled => {
+							await mcpManager.reconcileBrowserFilter(enabled);
+							return mcpManager.getTools();
+						}
+					: undefined,
 			memoryAgentDir: agentDir,
 			memoryTaskDepth: taskDepth,
 			createMemoryTools:

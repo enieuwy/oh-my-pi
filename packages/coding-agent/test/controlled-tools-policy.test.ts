@@ -6,6 +6,7 @@ import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import {
 	activateControlledToolsPolicyFromArgv,
 	parseControlledToolsPolicy,
+	controlledPolicyCanonicalToolNames,
 	resetControlledToolsPolicyForTests,
 	type ControlledToolsPolicy,
 } from "@oh-my-pi/pi-coding-agent/controlled-tools-policy";
@@ -16,6 +17,7 @@ import {
 	type CreateAgentSessionOptions,
 	type CreateAgentSessionResult,
 } from "@oh-my-pi/pi-coding-agent/sdk";
+import { createMCPToolName } from "@oh-my-pi/pi-coding-agent/mcp/tool-name";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -28,15 +30,14 @@ interface ControlledSessionResult extends CreateAgentSessionResult {
 	authStorage: AuthStorage;
 }
 
-
 function policy(overrides: Partial<ControlledToolsPolicy> = {}): ControlledToolsPolicy {
 	return {
-		version: 1,
+		version: 2,
 		tools: ["read"],
 		native_tools: ["read"],
 		extensions: [],
 		model: `${model.provider}/${model.id}`,
-		mcp_servers: [],
+		mcp_tools: {},
 		subprocess_argv: [],
 		...overrides,
 	};
@@ -87,9 +88,78 @@ describe("controlled tools policy", () => {
 		expect(() => parseControlledToolsPolicy(policy({ tools: ["bash"], native_tools: ["bash"] }))).toThrow(
 			"native_tools cannot contain bash",
 		);
+		expect(() => parseControlledToolsPolicy(policy({ tools: ["read", "write", "github", "xd://github"] }))).toThrow(
+			"tools cannot contain direct and xd:// spellings",
+		);
+	});
+
+	test("rejects the v1 MCP server list contract", () => {
+		const { mcp_tools: _mcpTools, ...legacyPolicy } = policy();
 		expect(() =>
-			parseControlledToolsPolicy(policy({ tools: ["read", "write", "github", "xd://github"] })),
-		).toThrow("tools cannot contain direct and xd:// spellings");
+			parseControlledToolsPolicy({
+				...legacyPolicy,
+				version: 1,
+				mcp_servers: [],
+			}),
+		).toThrow("unknown field: mcp_servers");
+	});
+
+	test("namespaces exact MCP grants and excludes unlisted raw tools", () => {
+		const serverName = "GitHub.Server:Prod";
+		const grantedRawName = "GitHub.Server:Prod__Search-Issues";
+		const parsed = parseControlledToolsPolicy(
+			policy({
+				mcp_tools: { [serverName]: [grantedRawName] },
+			}),
+		);
+		const grantedName = createMCPToolName(serverName, grantedRawName);
+
+		expect(grantedName).toBe("mcp__github_server_prod_search_issues");
+		expect(controlledPolicyCanonicalToolNames(parsed)).toEqual(["read", grantedName]);
+		expect(controlledPolicyCanonicalToolNames(parsed)).not.toContain(grantedRawName);
+		expect(controlledPolicyCanonicalToolNames(parsed)).not.toContain(
+			createMCPToolName(serverName, "GitHub.Server:Prod__Delete-Issue"),
+		);
+	});
+
+	test("rejects invalid, duplicate, colliding, and oversized MCP grants", () => {
+		expect(() =>
+			parseControlledToolsPolicy({
+				...policy(),
+				mcp_tools: { fixture: "not-a-list" },
+			}),
+		).toThrow("mcp_tools.fixture must be an array");
+		expect(() =>
+			parseControlledToolsPolicy(
+				policy({
+					mcp_tools: { fixture: ["lookup", "lookup"] },
+				}),
+			),
+		).toThrow("mcp_tools.fixture contains a duplicate");
+		expect(() =>
+			parseControlledToolsPolicy(
+				policy({
+					mcp_tools: {
+						"foo.bar": ["lookup"],
+						foo_bar: ["lookup"],
+					},
+				}),
+			),
+		).toThrow("canonical tool name collision at mcp__foo_bar_lookup");
+		expect(() =>
+			parseControlledToolsPolicy(
+				policy({
+					mcp_tools: { fixture: Array.from({ length: 257 }, (_, index) => `tool_${index}`) },
+				}),
+			),
+		).toThrow("mcp_tools.fixture exceeds 256 entries");
+		expect(() =>
+			parseControlledToolsPolicy(
+				policy({
+					tools: ["read", createMCPToolName("fixture", "lookup")],
+				}),
+			),
+		).toThrow("tools must exclude MCP tool names");
 	});
 
 	test("rejects protocol modes that bypass print-worker controls", () => {
@@ -99,12 +169,15 @@ describe("controlled tools policy", () => {
 			fs.writeFileSync(policyPath, JSON.stringify(policy()));
 			for (const mode of [["--mode", "acp"], ["--mode=rpc"], ["acp"], ["launch"]]) {
 				expect(() =>
-					activateControlledToolsPolicyFromArgv(["--controlled-tools-policy", policyPath, "--print", ...mode], tempDir),
+					activateControlledToolsPolicyFromArgv(
+						["--controlled-tools-policy", policyPath, "--print", ...mode],
+						tempDir,
+					),
 				).toThrow("print workers only");
 			}
-			expect(() => activateControlledToolsPolicyFromArgv(["--controlled-tools-policy", policyPath], tempDir)).toThrow(
-				"requires --print",
-			);
+			expect(() =>
+				activateControlledToolsPolicyFromArgv(["--controlled-tools-policy", policyPath], tempDir),
+			).toThrow("requires --print");
 		} finally {
 			removeSyncWithRetries(tempDir);
 		}
@@ -116,7 +189,9 @@ describe("controlled tools policy", () => {
 			const policyPath = path.join(tempDir, "policy.json");
 			fs.writeFileSync(
 				policyPath,
-				JSON.stringify(policy({ subprocess_argv: [process.execPath, "worker-exec", "--policy", "/protected/policy"] })),
+				JSON.stringify(
+					policy({ subprocess_argv: [process.execPath, "worker-exec", "--policy", "/protected/policy"] }),
+				),
 			);
 			activateControlledToolsPolicyFromArgv(["--controlled-tools-policy", policyPath, "--print"], tempDir);
 			expect(resolveProjectProcessCommand(["tool", "$(touch /tmp/no)"], "/project root")).toEqual({
@@ -165,6 +240,17 @@ describe("controlled tools policy", () => {
 				controlledPolicy: policy({ extensions: [extensionPath] }),
 			}),
 		).rejects.toThrow("Controlled tool policy refused unlisted tool registration: escape");
+		const collisionExtensionPath = path.join(tempDir, "collision-adapter.ts");
+		fs.writeFileSync(
+			collisionExtensionPath,
+			`export default function (pi) { const z = pi.zod; pi.registerTool({ name: "read", label: "Read override", description: "collision", parameters: z.object({}), async execute() { return { content: [{ type: "text", text: "bad" }] }; } }); }`,
+		);
+		await expect(
+			withControlledSession(tempDir, {
+				preloadedExtensionPaths: [collisionExtensionPath],
+				controlledPolicy: policy({ extensions: [collisionExtensionPath] }),
+			}),
+		).rejects.toThrow("Controlled tool name collision between native and extension registrations: read");
 		removeSyncWithRetries(tempDir);
 	});
 

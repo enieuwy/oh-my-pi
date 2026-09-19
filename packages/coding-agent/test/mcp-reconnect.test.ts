@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from "bun:test";
 import { createMCPJsonRpcError, MCPTransportError } from "@oh-my-pi/pi-coding-agent/mcp/errors";
+import { createMCPToolName } from "@oh-my-pi/pi-coding-agent/mcp/tool-name";
 import type { MCPReconnect } from "@oh-my-pi/pi-coding-agent/mcp/tool-bridge";
 import {
-	createMCPToolName,
 	DeferredMCPTool,
 	deduplicateMCPToolsByName,
 	isRetriableConnectionError,

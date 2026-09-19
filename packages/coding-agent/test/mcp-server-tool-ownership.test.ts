@@ -23,6 +23,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { MCPManager } from "@oh-my-pi/pi-coding-agent/mcp/manager";
+import { createMCPToolName } from "@oh-my-pi/pi-coding-agent/mcp/tool-name";
 import type { MCPStdioServerConfig } from "@oh-my-pi/pi-coding-agent/mcp/types";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 import { MANY_TOOL_COUNT, manyToolName } from "./fixtures/many-tools-mcp";
@@ -31,9 +32,9 @@ const FIXTURE_PATH = path.join(import.meta.dir, "fixtures", "many-tools-mcp.ts")
 
 const SHORT_SERVER = "atlassian";
 const COLON_SERVER = "atlassian:atlassian";
-/** Sanitized names minted by `createMCPToolName` for the first fixture tool. */
-const SHORT_TOOL = `mcp__atlassian_${manyToolName(0)}`;
-const COLON_TOOL = `mcp__atlassian_atlassian_${manyToolName(0)}`;
+/** Canonical names minted for the first fixture tool. */
+const SHORT_TOOL = createMCPToolName(SHORT_SERVER, manyToolName(0));
+const COLON_TOOL = createMCPToolName(COLON_SERVER, manyToolName(0));
 
 function fixtureConfig(): MCPStdioServerConfig {
 	return { type: "stdio", command: process.execPath, args: [FIXTURE_PATH] };
@@ -96,5 +97,38 @@ describe("MCP tool ownership with prefix-colliding server names", () => {
 		// the colon-named server's tools lingered as callable zombies).
 		expect(payloads.at(-1)?.some(name => name === COLON_TOOL)).toBe(false);
 		expect(payloads.at(-1)).toHaveLength(MANY_TOOL_COUNT);
+	}, 20_000);
+
+	it("loads only named servers and retains only exact controlled tool names across refreshes", async () => {
+		const allowedServer = "Controlled.Server";
+		const unlistedServer = "Unlisted.Server";
+		const grantedRawName = manyToolName(0);
+		const grantedName = createMCPToolName(allowedServer, grantedRawName);
+		const unlistedName = createMCPToolName(allowedServer, manyToolName(1));
+		fs.writeFileSync(
+			path.join(workDir, ".mcp.json"),
+			JSON.stringify({
+				mcpServers: {
+					[allowedServer]: fixtureConfig(),
+					[unlistedServer]: fixtureConfig(),
+				},
+			}),
+		);
+
+		const result = await manager.discoverAndConnect({
+			enableProjectConfig: true,
+			filterExa: false,
+			filterBrowser: false,
+			serverNames: [allowedServer],
+			toolNameCeiling: new Set([grantedName]),
+		});
+
+		expect(result.errors.size).toBe(0);
+		expect(manager.getConnectedServers()).toEqual([allowedServer]);
+		expect(manager.getTools().map(tool => tool.name)).toEqual([grantedName]);
+		expect(manager.getTools().map(tool => tool.name)).not.toContain(unlistedName);
+
+		await manager.refreshServerTools(allowedServer);
+		expect(manager.getTools().map(tool => tool.name)).toEqual([grantedName]);
 	}, 20_000);
 });
