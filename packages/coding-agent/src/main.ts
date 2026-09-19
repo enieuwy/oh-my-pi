@@ -6,9 +6,10 @@
  */
 import * as fsSync from "node:fs";
 import * as os from "node:os";
+import * as path from "node:path";
 import { createInterface } from "node:readline/promises";
 import { EventLoopKeepalive, type ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
+import { Effort, type ImageContent, type Model } from "@oh-my-pi/pi-ai";
 import {
 	$env,
 	directoryIsMissing,
@@ -57,6 +58,7 @@ import { injectOmpExtensionCliRoots } from "./discovery/omp-extension-roots";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import { loadExtensions } from "./extensibility/extensions/loader";
 import { ExtensionRunner } from "./extensibility/extensions/runner";
+import { controlledPolicyCanonicalToolNames, getActiveControlledToolsPolicy } from "./controlled-tools-policy";
 import type { ExtensionUIContext } from "./extensibility/extensions/types";
 import { scheduleMarketplaceAutoUpdate } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
@@ -818,6 +820,7 @@ export async function resolveScopedModels(
 	modelRegistry: Pick<ModelRegistry, "getAvailable" | "getDiscoverableProviders" | "refresh">,
 	activeSettings: Settings,
 ): Promise<ScopedModel[]> {
+	if (parsed.controlledToolsPolicy) return [];
 	const modelPatterns = parsed.models ?? activeSettings.get("enabledModels");
 	if (!modelPatterns || modelPatterns.length === 0) {
 		return [];
@@ -1101,10 +1104,12 @@ export async function buildSessionOptions(
 		options.deadline = Date.now() + parsed.maxTime * 1000;
 	}
 
-	// Auto-discover SYSTEM.md if no CLI system prompt provided
-	const systemPromptSource = parsed.systemPrompt ?? discoverSystemPromptFile();
-	const appendPromptSource = parsed.appendSystemPrompt ?? discoverAppendSystemPromptFile();
-	const titleSystemPromptSource = discoverTitleSystemPromptFile();
+	const controlled = getActiveControlledToolsPolicy();
+	// Controlled startup accepts prompts only when the supervisor supplied them.
+	// Ambient project prompt files are not part of the policy.
+	const systemPromptSource = parsed.systemPrompt ?? (controlled ? undefined : discoverSystemPromptFile());
+	const appendPromptSource = parsed.appendSystemPrompt ?? (controlled ? undefined : discoverAppendSystemPromptFile());
+	const titleSystemPromptSource = controlled ? undefined : discoverTitleSystemPromptFile();
 	const [resolvedSystemPrompt, resolvedAppendPrompt, titleSystemPrompt] = await Promise.all([
 		resolvePromptInput(systemPromptSource, "system prompt"),
 		resolvePromptInput(appendPromptSource, "append system prompt"),
@@ -1381,6 +1386,19 @@ export async function buildSessionOptions(
 		}
 	}
 
+	if (controlled) {
+		options.controlledPolicy = controlled.policy;
+		options.controlledConfigCwd = controlled.bootstrapCwd;
+		if (options.model) {
+			options.model = {
+				...options.model,
+				compactionModel: undefined,
+				contextPromotionTarget: undefined,
+				remoteCompaction: undefined,
+			};
+		}
+	}
+
 	return options;
 }
 
@@ -1408,12 +1426,41 @@ export async function runRootCommand(
 		await logger.time("initTheme:initial", ensureTheme);
 
 		const parsedArgs = parsed;
-		try {
-			await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
-		} catch (error: unknown) {
-			const message = error instanceof Error ? error.message : String(error);
-			process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
-			process.exit(1);
+		const controlled = getActiveControlledToolsPolicy();
+		let controlledProjectCwd: string | undefined;
+		if (controlled) {
+			if (parsedArgs.controlledToolsPolicy !== controlled.path) {
+				throw new Error("Controlled policy parsing did not preserve the activated policy path");
+			}
+			if (!parsedArgs.cwd || !path.isAbsolute(parsedArgs.cwd)) {
+				throw new Error("Controlled startup requires an absolute --cwd");
+			}
+			const projectStat = fsSync.statSync(parsedArgs.cwd);
+			if (!projectStat.isDirectory()) throw new Error(`Controlled --cwd is not a directory: ${parsedArgs.cwd}`);
+			if (parsedArgs.thinking === "auto") {
+				throw new Error("Controlled startup does not allow the auto thinking classifier");
+			}
+			controlledProjectCwd = parsedArgs.cwd;
+			parsedArgs.model = controlled.policy.model;
+			parsedArgs.provider = undefined;
+			parsedArgs.tools = controlledPolicyCanonicalToolNames(controlled.policy);
+			parsedArgs.trustedExtensions = [...controlled.policy.extensions];
+			parsedArgs.extensions = undefined;
+			parsedArgs.hooks = undefined;
+			parsedArgs.noExtensions = true;
+			parsedArgs.noPrewalk = true;
+			parsedArgs.prewalk = false;
+			parsedArgs.advisor = false;
+			parsedArgs.noTitle = true;
+			parsedArgs.noLsp = !controlled.policy.native_tools.includes("lsp");
+		} else {
+			try {
+				await logger.time("applyStartupCwd", applyStartupCwd, parsedArgs);
+			} catch (error: unknown) {
+				const message = error instanceof Error ? error.message : String(error);
+				process.stderr.write(`${chalk.red(`Error: ${message}`)}\n`);
+				process.exit(1);
+			}
 		}
 
 		const notifs: (InteractiveModeNotify | null)[] = [];
@@ -1449,8 +1496,9 @@ export async function runRootCommand(
 		// Kick off plugin-root preload in parallel with the remaining startup work.
 		// Awaited later (before extension/skill discovery in createAgentSession needs it).
 		const home = os.homedir();
-		const pluginPreloadPromise =
-			parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
+		const pluginPreloadPromise = controlled
+			? Promise.resolve()
+			: parsedArgs.pluginDirs && parsedArgs.pluginDirs.length > 0
 				? logger.time("injectPluginDirRoots", injectPluginDirRoots, home, parsedArgs.pluginDirs, getProjectDir())
 				: logger.time("preloadPluginRoots", preloadPluginRoots, home, getProjectDir());
 		// Mark the promise as handled so a synchronous failure does not surface as an unhandled-rejection
@@ -1459,7 +1507,7 @@ export async function runRootCommand(
 
 		// Trusted files load as exact module paths, never as package roots whose
 		// sibling hooks/tools/commands/MCP content could be discovered implicitly.
-		if (!parsedArgs.trustedExtensions?.length) {
+		if (!controlled && !parsedArgs.trustedExtensions?.length) {
 			// Register CLI-provided extension package paths (`--extension`, `--hook`) so
 			// the `omp-plugins` discovery provider can surface their `skills/`, `hooks/`,
 			// `tools/`, `commands/`, `rules/`, `prompts/`, and `.mcp.json` sub-trees.
@@ -1472,7 +1520,7 @@ export async function runRootCommand(
 			});
 		}
 
-		let cwd = getProjectDir();
+		let cwd = controlledProjectCwd ?? getProjectDir();
 		// Classify the host before opening auth or settings storage so every
 		// session-critical database connection picks the right busy timeout.
 		// See getDbBusyTimeoutMs().
@@ -1495,7 +1543,10 @@ export async function runRootCommand(
 		authStoragePromise.catch(() => {});
 		const settingsPromise = deps.settings
 			? Promise.resolve(deps.settings)
-			: logger.time("settings:init", Settings.init, { cwd, configFiles: parsedArgs.config });
+			: logger.time("settings:init", controlled ? Settings.loadReadOnly : Settings.init, {
+					cwd: controlled?.bootstrapCwd ?? cwd,
+					configFiles: parsedArgs.config,
+				});
 		settingsPromise.catch(() => {});
 		let authStorage: AuthStorage;
 		try {
@@ -1508,6 +1559,23 @@ export async function runRootCommand(
 		}
 
 		const settingsInstance = await settingsPromise;
+		if (controlled) {
+			settingsInstance.override("advisor.enabled", false);
+			settingsInstance.override("prewalk.enabled", false);
+			settingsInstance.override("retry.enabled", false);
+			settingsInstance.override("retry.fallbackChains", {});
+			settingsInstance.override("images.describeForTextModels", false);
+			settingsInstance.override("features.unexpectedStopDetection", "none");
+			settingsInstance.override("memory.backend", "off");
+			settingsInstance.override("autolearn.enabled", false);
+			settingsInstance.override("lsp.shared", false);
+			settingsInstance.override("generate_image.enabled", false);
+			settingsInstance.override("speechgen.enabled", false);
+			settingsInstance.override("speech.enabled", false);
+			if (settingsInstance.get("defaultThinkingLevel") === "auto") {
+				settingsInstance.override("defaultThinkingLevel", Effort.High);
+			}
+		}
 		if (parsedArgs.approvalMode) {
 			// Runtime override (not persisted): every settings.get("tools.approvalMode") downstream
 			// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -1545,9 +1613,9 @@ export async function runRootCommand(
 		logger.time("initializeWithSettings", initializeWithSettings, settingsInstance);
 
 		// Apply model role overrides from CLI args or env vars (ephemeral, not persisted)
-		const smolModel = parsedArgs.smol ?? $env.PI_SMOL_MODEL;
-		const slowModel = parsedArgs.slow ?? $env.PI_SLOW_MODEL;
-		const planModel = parsedArgs.plan ?? $env.PI_PLAN_MODEL;
+		const smolModel = controlled ? undefined : (parsedArgs.smol ?? $env.PI_SMOL_MODEL);
+		const slowModel = controlled ? undefined : (parsedArgs.slow ?? $env.PI_SLOW_MODEL);
+		const planModel = controlled ? undefined : (parsedArgs.plan ?? $env.PI_PLAN_MODEL);
 		if (smolModel || slowModel || planModel) {
 			settingsInstance.overrideModelRoles({
 				smol: smolModel,
@@ -1807,15 +1875,17 @@ export async function runRootCommand(
 			}
 		}
 		await pluginPreloadPromise;
-		if (deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
+		if (!controlled && deps === DEFAULT_RUN_ROOT_DEPENDENCIES) {
 			await logger.time("registerDaemonProjectPresence", registerDaemonProjectPresence, cwd);
 		}
 
-		scheduleMarketplaceAutoUpdate({
-			autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
-			resolveActiveProjectRegistryPath,
-			clearPluginRootsCache: clearPluginRootsAndCaches,
-		});
+		if (!controlled) {
+			scheduleMarketplaceAutoUpdate({
+				autoUpdate: settingsInstance.get("marketplace.autoUpdate"),
+				resolveActiveProjectRegistryPath,
+				clearPluginRootsCache: clearPluginRootsAndCaches,
+			});
+		}
 
 		const sessionOptions = await logger.time(
 			"buildSessionOptions",
@@ -1835,9 +1905,11 @@ export async function runRootCommand(
 		// env, then switch on the agent loop's telemetry hooks so traces, run-level
 		// metrics, and structured logs have source events to export. Content capture
 		// remains governed by OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT.
-		await logger.time("initTelemetryExport", initTelemetryExport);
-		if (isTelemetryExportEnabled()) {
-			sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
+		if (!controlled) {
+			await logger.time("initTelemetryExport", initTelemetryExport);
+			if (isTelemetryExportEnabled()) {
+				sessionOptions.telemetry = createTelemetryExportConfig(sessionOptions.telemetry);
+			}
 		}
 
 		// Handle CLI --api-key as runtime override (not persisted)
@@ -1859,7 +1931,7 @@ export async function runRootCommand(
 			// Kick off background model discovery only after createAgentSession finishes its parallel
 			// discovery arms; running these concurrently contends for the event loop and stretches
 			// every parallel arm by ~30ms.
-			modelRegistry.refreshInBackground();
+			if (!controlled) modelRegistry.refreshInBackground();
 			return result;
 		};
 

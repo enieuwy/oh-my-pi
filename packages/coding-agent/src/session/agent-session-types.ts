@@ -164,6 +164,10 @@ export interface AgentSessionConfig {
 	thinkingLevelCeiling?: Effort;
 	/** Retry chain ownership when startup selected one of its fallback entries. */
 	initialRetryFallback?: InitialRetryFallbackState;
+	/** Exact provider/model id permitted for every model transition in this session. */
+	exactModelCeiling?: string;
+	/** Disable advisor, image-question, title, and other auxiliary model paths. */
+	disableAuxiliaryModels?: boolean;
 	/** Prewalk from the starting model to a fast/cheap target after implementation begins. */
 	prewalk?: Prewalk;
 	/** Force read-only plan mode at start, auto-approve, then switch to the target. */

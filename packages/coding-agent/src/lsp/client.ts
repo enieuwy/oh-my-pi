@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { isEnoent, logger, postmortem, ptree, stableStringifyJson, untilAborted } from "@oh-my-pi/pi-utils";
+import { resolveProjectProcessCommand } from "../controlled-project-process";
 import { MessageFramer } from "../jsonrpc/message-framing";
 import { ToolAbortError, throwIfAborted } from "../tools/tool-errors";
 import { applyWorkspaceEdit, type ExecutedWorkspaceChange } from "./edits";
@@ -1012,8 +1013,9 @@ export async function getOrCreateClient(
 		if (sharedLspEnabled && command === baseCommand) {
 			proc = await connectSharedLspTransport({ command, args, cwd, env, signal });
 		}
-		proc ??= ptree.spawn([command, ...args], {
-			cwd,
+		const resolvedProcess = resolveProjectProcessCommand([command, ...args], cwd);
+		proc ??= ptree.spawn(resolvedProcess.command, {
+			cwd: resolvedProcess.cwd,
 			stdin: "pipe",
 			env: env ? { ...Bun.env, ...env } : undefined,
 		});

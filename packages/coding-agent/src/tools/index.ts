@@ -175,6 +175,8 @@ export interface ToolSession {
 	getApiKey?: AgentOptions["getApiKey"];
 	/** Skip subprocess-kernel availability checks and warmup */
 	skipPythonPreflight?: boolean;
+	/** Refuse tool paths that would select an auxiliary model. */
+	disableAuxiliaryModels?: boolean;
 	/** Pre-loaded context files (AGENTS.md, etc) */
 	contextFiles?: ContextFileEntry[];
 	/** Pre-loaded workspace tree (forwarded to subagents to skip re-scanning) */
@@ -255,6 +257,8 @@ export interface ToolSession {
 	 * required yield tool). Suppresses automatic tool-set expansion.
 	 */
 	restrictToolNames?: boolean;
+	/** Exact built-in names a controlled policy permits. Disables all automatic widening. */
+	controlledToolNames?: ReadonlySet<string>;
 	/** Task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/** Get shared eval executor session ID. Subagents inherit this to share JS/Python state. */
@@ -495,9 +499,11 @@ export type ToolName = BuiltinToolName;
  */
 export async function createTools(session: ToolSession, toolNames?: string[]): Promise<Tool[]> {
 	const restrictToolNames = session.restrictToolNames === true;
+	const controlledToolNames = session.controlledToolNames;
+	const controlled = controlledToolNames !== undefined;
 	const includeYield = session.requireYieldTool === true;
 	const enableLsp = session.enableLsp ?? true;
-	const requestedTools = restrictToolNames
+	const requestedTools = restrictToolNames || controlled
 		? normalizeToolNames(toolNames ?? [])
 		: toolNames
 			? normalizeToolNames(toolNames)
@@ -510,7 +516,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		session.pendingFullWriteDescription = undefined;
 	}
 	const goalEnabled = session.settings.get("goal.enabled");
-	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
+	const goalModeActive = !restrictToolNames && !controlled && goalEnabled && session.getGoalModeState?.()?.enabled === true;
 	const externalThinkingActive =
 		session.settings.get("externalThinking") && supportsExternalThinking(session.getActiveModel?.());
 	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
@@ -550,7 +556,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// the sister tool so a one-sided frontmatter `tools:` entry still works.
 	// Unlike the AST/auto-learn convenience auto-includes below, this is a
 	// safety pairing — it applies to restricted sessions too.
-	if (requestedTools && session.settings.get("checkpoint.enabled")) {
+	if (requestedTools && !controlled && session.settings.get("checkpoint.enabled")) {
 		if (requestedTools.includes("checkpoint") && !requestedTools.includes("rewind")) {
 			requestedTools.push("rewind");
 		} else if (requestedTools.includes("rewind") && !requestedTools.includes("checkpoint")) {
@@ -559,7 +565,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	// Auto-include AST counterparts when their text-based sibling is present.
 	// Restricted callers own the active list and must not have it widened.
-	if (requestedTools && !restrictToolNames) {
+	if (requestedTools && !restrictToolNames && !controlled) {
 		if (goalModeActive && !requestedTools.includes("goal")) {
 			requestedTools.push("goal");
 		}
@@ -606,6 +612,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	}
 	const allTools: Record<string, ToolFactory> = { ...BUILTIN_TOOLS, ...HIDDEN_TOOLS };
 	const isToolAllowed = (name: string) => {
+		if (controlledToolNames && !controlledToolNames.has(name)) return false;
 		// Never in the default set. Explicitly activatable while goal.enabled and
 		// no goal record exists yet — /guided-goal enables it so the agent can
 		// finish the interview with `goal create`, which turns goal mode on. Once
@@ -662,7 +669,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		}
 		return true;
 	};
-	if (includeYield && requestedTools && !requestedTools.includes("yield")) {
+	if (includeYield && !controlled && requestedTools && !requestedTools.includes("yield")) {
 		requestedTools.push("yield");
 	}
 
@@ -710,6 +717,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	// capability is expanded: without mounting, those tools were already
 	// presented — and callable — top-level.
 	if (
+		!controlled &&
 		xdevRequested &&
 		requestedTools !== undefined &&
 		!tools.some(tool => tool.name === "write") &&
@@ -754,6 +762,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const xdevMounted = (session.xdev?.mountedNames.size ?? 0) > 0;
 	if (
 		!restrictToolNames &&
+		!controlled &&
 		tools.some(tool => tool.deferrable === true) &&
 		!tools.some(tool => tool.name === "write")
 	) {
@@ -765,7 +774,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 			builtInNames.add(wrapped.name);
 		}
 	}
-	if (!restrictToolNames && xdevMounted && !tools.some(tool => tool.name === "read")) {
+	if (!restrictToolNames && !controlled && xdevMounted && !tools.some(tool => tool.name === "read")) {
 		const readTool = await logger.time("createTools:read", BUILTIN_TOOLS.read, session);
 		if (readTool) {
 			const wrapped = wrapToolWithMetaNotice(readTool);

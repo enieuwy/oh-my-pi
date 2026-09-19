@@ -994,6 +994,9 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 	}): Promise<{ content: Array<TextContent | ImageContent>; details: ReadToolDetails; sourcePath: string }> {
 		const { readPath, absolutePath, mimeType, imageMetadata, fileSize, imageKind, question, questionPath, signal } =
 			options;
+		if (question && this.session.disableAuxiliaryModels) {
+			throw new ToolError("Image questions are disabled by the controlled model policy.");
+		}
 		if (!question && !(this.session.getActiveModel?.()?.input.includes("image") ?? true)) {
 			const outputMime = imageMetadata?.mimeType ?? mimeType;
 			const imageQuestionPath = questionPath ?? formatPathRelativeToCwd(absolutePath, this.session.cwd);
@@ -1010,8 +1013,12 @@ export class ReadTool implements AgentTool<typeof readSchema, ReadToolDetails> {
 					: imageMetadata?.hasAlpha === false
 						? "- Alpha: no"
 						: "- Alpha: unknown",
-				"",
-				`To analyze the image, read \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`,
+				...(this.session.disableAuxiliaryModels
+					? []
+					: [
+							"",
+							`To analyze the image, read \`${imageQuestionPath}?q=<question>\` — the question is answered by a vision model and returned as text.`,
+						]),
 			];
 			return { content: [{ type: "text", text: metadataLines.join("\n") }], details: {}, sourcePath: absolutePath };
 		}

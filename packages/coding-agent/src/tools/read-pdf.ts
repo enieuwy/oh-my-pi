@@ -1,5 +1,6 @@
 import { pathToFileURL } from "node:url";
 import { untilAborted } from "@oh-my-pi/pi-utils";
+import { getActiveControlledToolsPolicy } from "../controlled-tools-policy";
 import type { ToolSession } from "../sdk";
 import type { BrowserHandle } from "./browser/registry";
 import type { ScreenshotResult } from "./browser/tab-protocol";
@@ -80,6 +81,9 @@ export async function renderPdfPageScreenshot(
 	page: number,
 	signal?: AbortSignal,
 ): Promise<ScreenshotResult> {
+	if (getActiveControlledToolsPolicy()) {
+		throw new ToolError("PDF browser rendering is unavailable in controlled mode; read the PDF text instead.");
+	}
 	const [{ acquireBrowser, holdBrowser, releaseBrowser }, { acquireTab, releaseTab, runInTab }] = await Promise.all([
 		import("./browser/registry"),
 		import("./browser/tab-supervisor"),

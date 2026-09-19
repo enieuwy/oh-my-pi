@@ -13,6 +13,7 @@ import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
 import { logger, ptree } from "@oh-my-pi/pi-utils";
+import { getActiveControlledToolsPolicy } from "../../controlled-tools-policy";
 import { MessageFramer } from "../../jsonrpc/message-framing";
 import { daemonClientForProject } from "../../launch/client";
 import { describeQuietly, stopQuietly, waitReady } from "../../launch/ensure";
@@ -293,6 +294,7 @@ export async function connectSharedLspTransport(opts: {
 	env?: Record<string, string>;
 	signal?: AbortSignal;
 }): Promise<LspTransport | null> {
+	if (getActiveControlledToolsPolicy()) return null;
 	try {
 		const endpoint = await ensureLspMuxDaemon(opts.cwd, opts.signal);
 		if (!endpoint) return null;

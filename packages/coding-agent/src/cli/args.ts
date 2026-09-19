@@ -32,6 +32,8 @@ export interface Args {
 	provider?: string;
 	model?: string;
 	config?: string[];
+	/** Absolute policy file loaded before profile, settings, or project discovery. */
+	controlledToolsPolicy?: string;
 	smol?: string;
 	slow?: string;
 	plan?: string;

@@ -4,6 +4,7 @@
  */
 import * as path from "node:path";
 import { logger } from "@oh-my-pi/pi-utils";
+import { spawnProjectProcess } from "../../controlled-project-process";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 // =============================================================================
@@ -66,7 +67,7 @@ async function runBiome(
 	const command = resolvedCommand ?? "biome";
 
 	try {
-		const proc = Bun.spawn([command, ...args], {
+		const proc = spawnProjectProcess([command, ...args], {
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",

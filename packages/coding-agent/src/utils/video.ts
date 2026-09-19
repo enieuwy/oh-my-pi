@@ -10,6 +10,7 @@
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
 import { $which, TempDir, untilAborted } from "@oh-my-pi/pi-utils";
+import { getActiveControlledToolsPolicy } from "../controlled-tools-policy";
 
 /** Container extensions treated as video. Mirrors the video subset of the local-protocol binary list. */
 const VIDEO_EXTENSION_LOOKUP: Record<string, true> = {
@@ -172,6 +173,9 @@ async function framePassthroughFlag(): Promise<string[]> {
 
 /** Resolve a system binary or throw a user-facing install hint. */
 function requireMediaBinary(name: "ffmpeg" | "ffprobe"): string {
+	if (getActiveControlledToolsPolicy()) {
+		throw new VideoError("Video subprocess conversion is unavailable in controlled mode.");
+	}
 	const found = $which(name);
 	if (!found) {
 		throw new VideoError(

@@ -2,6 +2,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { $flag, $which, logger } from "@oh-my-pi/pi-utils";
 import { TOML } from "bun";
+import { getActiveControlledToolsPolicy } from "../controlled-tools-policy";
 
 /**
  * lspmux integration for LSP server multiplexing.
@@ -130,6 +131,9 @@ async function checkServerRunning(binaryPath: string): Promise<boolean> {
  * Set PI_DISABLE_LSPMUX=1 to disable.
  */
 export async function detectLspmux(): Promise<LspmuxState> {
+	if (getActiveControlledToolsPolicy()) {
+		return { available: false, running: false, binaryPath: null, config: null };
+	}
 	const now = Date.now();
 	if (cachedState && now - cacheTimestamp < STATE_CACHE_TTL_MS) {
 		return cachedState;

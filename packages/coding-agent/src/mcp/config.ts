@@ -4,6 +4,7 @@
  * Uses the capability system to load MCP servers from multiple sources.
  */
 
+import * as fs from "node:fs";
 import { getMCPConfigPath } from "@oh-my-pi/pi-utils";
 import { mcpCapability } from "../capability/mcp";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
@@ -22,6 +23,8 @@ export interface LoadMCPConfigsOptions {
 	filterBrowser?: boolean;
 	/** Session-local extension roots for post-startup rediscovery (explicit + mode + configured). */
 	extensionRoots?: EffectiveExtensionRoots;
+	/** Load only the controlled OMP user mcp.json file. */
+	onlyUserConfig?: boolean;
 }
 
 /** Result of loading MCP configs */
@@ -103,6 +106,45 @@ export async function loadAllMCPConfigs(cwd: string, options?: LoadMCPConfigsOpt
 	const enableProjectConfig = options?.enableProjectConfig ?? true;
 	const filterExa = options?.filterExa ?? true;
 	const filterBrowser = options?.filterBrowser ?? false;
+	if (options?.onlyUserConfig) {
+		const userPath = getMCPConfigPath("user", cwd);
+		try {
+			const stat = await fs.promises.lstat(userPath);
+			if (stat.isSymbolicLink() || !stat.isFile()) {
+				throw new Error(`Controlled MCP config must be a regular non-symlink file: ${userPath}`);
+			}
+			if (stat.size > 1024 * 1024) throw new Error(`Controlled MCP config exceeds 1048576 bytes: ${userPath}`);
+			const content = await fs.promises.readFile(userPath, "utf8");
+			const parsed = JSON.parse(content) as unknown;
+			if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+				throw new Error(`Controlled MCP config must be a JSON object: ${userPath}`);
+			}
+			const root = parsed as { mcpServers?: unknown; disabledServers?: unknown };
+			if (!root.mcpServers || typeof root.mcpServers !== "object" || Array.isArray(root.mcpServers)) {
+				return { configs: {}, exaApiKeys: [], sources: {} };
+			}
+			const disabled = new Set(
+				Array.isArray(root.disabledServers)
+					? root.disabledServers.filter((name): name is string => typeof name === "string")
+					: [],
+			);
+			const configs: Record<string, MCPServerConfig> = Object.create(null);
+			const sources: Record<string, SourceMeta> = Object.create(null);
+			for (const [name, value] of Object.entries(root.mcpServers)) {
+				if (!value || typeof value !== "object" || Array.isArray(value) || disabled.has(name)) continue;
+				const config = value as MCPServerConfig;
+				if (config.enabled === false) continue;
+				configs[name] = config;
+				sources[name] = { provider: "omp", providerName: "OMP", path: userPath, level: "user" };
+			}
+			return { configs, exaApiKeys: [], sources };
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+				return { configs: {}, exaApiKeys: [], sources: {} };
+			}
+			throw error;
+		}
+	}
 
 	// Load user-level disable/force-enable lists. The denylist always wins; the
 	// allowlist overrides a non-writable source config's `enabled: false`.

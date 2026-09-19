@@ -3,6 +3,7 @@
  * Parses SwiftLint's JSON reporter output into LSP Diagnostic format.
  */
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
+import { spawnProjectProcess } from "../../controlled-project-process";
 
 /** Shape of a single violation from `swiftlint lint --reporter json`. */
 interface SwiftLintViolation {
@@ -35,7 +36,7 @@ async function runSwiftLint(
 	const command = resolvedCommand ?? "swiftlint";
 
 	try {
-		const proc = Bun.spawn([command, ...args], {
+		const proc = spawnProjectProcess([command, ...args], {
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",

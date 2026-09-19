@@ -187,6 +187,14 @@ export interface MCPDiscoverOptions {
 	extensionRoots?: EffectiveExtensionRoots;
 	/** Called when MCP server connection state changes. */
 	onStatus?: (event: McpConnectionStatusEvent) => void;
+	/** Protected config cwd used instead of the active project cwd. */
+	configCwd?: string;
+	/** Exact server names that this manager may load or connect. */
+	serverNames?: readonly string[];
+	/** Exact canonical tool names that initial loads and refreshes may retain. */
+	toolNameCeiling?: ReadonlySet<string>;
+	/** Load configs only from the OMP user mcp.json file. */
+	onlyUserConfig?: boolean;
 }
 
 /** Handles an MCP `WWW-Authenticate` challenge and returns refreshed config. */
@@ -469,11 +477,12 @@ export class MCPManager {
 		this.#discoverOptions = options ? { ...options } : undefined;
 		let loadedConfigs: LoadMCPConfigsResult;
 		try {
-			loadedConfigs = await this.loadConfigs(this.cwd, {
+			loadedConfigs = await this.loadConfigs(options?.configCwd ?? this.cwd, {
 				enableProjectConfig: options?.enableProjectConfig,
 				filterExa: options?.filterExa,
 				filterBrowser: options?.filterBrowser,
 				extensionRoots: options?.extensionRoots,
+				onlyUserConfig: options?.onlyUserConfig,
 			});
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -481,7 +490,17 @@ export class MCPManager {
 			this.#emitConnectionStatus({ type: "failed", serverName: ".mcp.json", error: message });
 			throw error;
 		}
-		const { configs, exaApiKeys, sources } = loadedConfigs;
+		let { configs, sources } = loadedConfigs;
+		const { exaApiKeys } = loadedConfigs;
+		if (options?.serverNames) {
+			const requestedNames = new Set(options.serverNames);
+			const missingNames = options.serverNames.filter(name => configs[name] === undefined);
+			if (missingNames.length > 0) {
+				throw new Error(`Configured MCP servers unavailable: ${missingNames.join(", ")}`);
+			}
+			configs = Object.fromEntries(Object.entries(configs).filter(([name]) => requestedNames.has(name)));
+			sources = Object.fromEntries(Object.entries(sources).filter(([name]) => requestedNames.has(name)));
+		}
 		const result = await this.connectServers(configs, sources, options?.onStatus);
 		result.exaApiKeys = exaApiKeys;
 		return result;
@@ -500,11 +519,12 @@ export class MCPManager {
 
 	async #applyBrowserFilter(enabled: boolean): Promise<void> {
 		const options = this.#discoverOptions;
-		const loaded = await this.loadConfigs(this.cwd, {
+		const loaded = await this.loadConfigs(options?.configCwd ?? this.cwd, {
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: false,
 			extensionRoots: options?.extensionRoots,
+			onlyUserConfig: options?.onlyUserConfig,
 		});
 		const browserConfigs: Record<string, MCPServerConfig> = {};
 		const browserSources: Record<string, SourceMeta> = {};
@@ -545,6 +565,14 @@ export class MCPManager {
 		sources: Record<string, SourceMeta>,
 		onStatus?: (event: McpConnectionStatusEvent) => void,
 	): Promise<MCPLoadResult> {
+		const allowedServerNames = this.#discoverOptions?.serverNames;
+		if (allowedServerNames) {
+			const allowed = new Set(allowedServerNames);
+			const forbidden = Object.keys(configs).filter(name => !allowed.has(name));
+			if (forbidden.length > 0) {
+				throw new Error(`Controlled MCP server connection refused: ${forbidden.join(", ")}`);
+			}
+		}
 		const notify = (event: McpConnectionStatusEvent) => {
 			onStatus?.(event);
 			this.#emitConnectionStatus(event);
@@ -811,8 +839,10 @@ export class MCPManager {
 	 * with sanitized characters never prefix-matches its own tools at all.
 	 */
 	#replaceServerTools(name: string, tools: CustomTool<TSchema, MCPToolDetails>[]): void {
-		this.#tools = this.#tools.filter(t => t.mcpServerName !== name);
-		this.#tools.push(...tools);
+		const ceiling = this.#discoverOptions?.toolNameCeiling;
+		const admitted = ceiling ? tools.filter(tool => ceiling.has(tool.name)) : tools;
+		this.#tools = this.#tools.filter(tool => tool.mcpServerName !== name);
+		this.#tools.push(...admitted);
 		// Stable sort by name so reconnect order does not perturb the array.
 		// See `sortMCPToolsByName` for the cache-stability rationale.
 		sortMCPToolsByName(this.#tools);

@@ -114,6 +114,9 @@ export const STRING_SETTERS: Record<string, StringSetter> = {
 	"--cwd": (result, value) => {
 		result.cwd = value;
 	},
+	"--controlled-tools-policy": (result, value) => {
+		result.controlledToolsPolicy = value;
+	},
 	"--config": (result, value) => {
 		result.config = [...(result.config ?? []), value];
 	},

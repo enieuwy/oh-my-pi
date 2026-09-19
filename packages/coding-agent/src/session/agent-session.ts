@@ -379,6 +379,15 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
+/** Remove every model-owned route that can issue a request to another model. */
+function removeAuxiliaryModelRoutes(model: Model): Model {
+	return {
+		...model,
+		compactionModel: undefined,
+		contextPromotionTarget: undefined,
+		remoteCompaction: { enabled: false },
+	};
+}
 
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
@@ -702,6 +711,8 @@ export class AgentSession {
 	// Model registry for API key resolution
 	#modelRegistry: ModelRegistry;
 	#usageFallbackConfirmer: UsageFallbackConfirmer | undefined;
+	readonly #exactModelCeiling: string | undefined;
+	readonly #disableAuxiliaryModels: boolean;
 	#usagePreflightAbortControllers = new Set<AbortController>();
 	#queuedMessageDrainBlocked = false;
 	#modeExitDrainSuppressionDepth = 0;
@@ -1153,6 +1164,8 @@ export class AgentSession {
 		this.sessionManager = config.sessionManager;
 		this.settings = config.settings;
 		this.#modelRegistry = config.modelRegistry;
+		this.#exactModelCeiling = config.exactModelCeiling;
+		this.#disableAuxiliaryModels = config.disableAuxiliaryModels === true;
 		this.#extensionRoots =
 			config.extensionRoots ??
 			(() => ({
@@ -1256,6 +1269,7 @@ export class AgentSession {
 			promptGeneration: () => this.#promptGeneration,
 			resolveActiveEditMode: () => this.#tools.resolveActiveEditMode(),
 			syncAfterModelChange: previousEditMode => this.#tools.syncAfterModelChange(previousEditMode),
+			assertModelAllowed: model => this.#assertModelAllowed(model),
 			setModelWithProviderSessionReset: model => this.#setModelWithProviderSessionReset(model),
 			clearActiveRetryFallback: () => this.#recovery.clearActiveRetryFallback(),
 			clearInheritedProviderPromptCacheKey: () => this.#clearInheritedProviderPromptCacheKey(),
@@ -1267,6 +1281,7 @@ export class AgentSession {
 		this.#models = new ModelControls(modelControlsHost, {
 			scopedModels: config.scopedModels,
 			thinkingLevel: config.thinkingLevel,
+			disableAutoThinking: this.#disableAuxiliaryModels,
 			thinkingLevelCeiling: config.thinkingLevelCeiling,
 			serviceTierByFamily: config.serviceTierByFamily,
 		});
@@ -1703,7 +1718,7 @@ export class AgentSession {
 			sessionId: () => this.sessionId,
 		};
 		this.#advisors = new SessionAdvisors(advisorsHost, {
-			enabled: this.settings.get("advisor.enabled"),
+			enabled: !this.#disableAuxiliaryModels && this.settings.get("advisor.enabled"),
 			tools: config.advisorTools,
 			createGrepTool: config.advisorCreateGrepTool,
 			createEditTool: config.advisorCreateEditTool,
@@ -1727,7 +1742,12 @@ export class AgentSession {
 			sideStreamFn: this.#sideStreamFn,
 			providerSessionState: this.#providerSessionState,
 			preferWebsockets: this.#preferWebsockets,
+			disableRemoteCompaction: this.#disableAuxiliaryModels,
 			model: () => this.model,
+			prepareCompactionModel: model => {
+				if (!this.#disableAuxiliaryModels) return model;
+				return this.model && modelsAreEqual(model, this.model) ? removeAuxiliaryModelRoutes(model) : undefined;
+			},
 			thinkingLevel: () => this.thinkingLevel,
 			isDisposed: () => this.#isDisposed,
 			isStreaming: () => this.isStreaming,
@@ -4828,7 +4848,7 @@ export class AgentSession {
 			if (!current || !modelsAreEqual(current, refreshed) || refreshed.contextWindow === current.contextWindow) {
 				return;
 			}
-			this.agent.setModel(refreshed);
+			this.agent.setModel(this.#disableAuxiliaryModels ? removeAuxiliaryModelRoutes(refreshed) : refreshed);
 		} catch (error) {
 			logger.debug("Lazy local model context refresh failed", {
 				provider: model.provider,
@@ -8199,16 +8219,24 @@ export class AgentSession {
 		}
 	}
 
+	#assertModelAllowed(model: Model): void {
+		if (this.#exactModelCeiling && `${model.provider}/${model.id}` !== this.#exactModelCeiling) {
+			throw new Error(`Controlled model switch refused: ${model.provider}/${model.id}`);
+		}
+	}
+
 	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
+		this.#assertModelAllowed(model);
+		const admittedModel = this.#disableAuxiliaryModels ? removeAuxiliaryModelRoutes(model) : model;
 		const currentModel = this.model;
-		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
+		const isChanging = !currentModel || !modelsAreEqual(currentModel, admittedModel);
 		if (currentModel) {
-			this.#closeProviderSessionsForModelSwitch(currentModel, model);
+			this.#closeProviderSessionsForModelSwitch(currentModel, admittedModel);
 			if (isChanging) {
 				this.#clearInheritedProviderPromptCacheKey();
 			}
 		}
-		this.agent.setModel(model);
+		this.agent.setModel(admittedModel);
 		// Model mutations driven through ModelControls (explicit /model, prewalk
 		// hand-offs, retry-fallback, model cycling) funnel through this method,
 		// so this is the single point that notifies subscribers (ACP config
@@ -8226,7 +8254,7 @@ export class AgentSession {
 			this.#emit({ type: "model_changed" });
 		}
 
-		await this.#reconcileModelDependentState(currentModel, model);
+		await this.#reconcileModelDependentState(currentModel, admittedModel);
 	}
 
 	async #reconcileModelDependentState(previousModel: Model | undefined, model: Model): Promise<void> {
@@ -8410,6 +8438,9 @@ export class AgentSession {
 		onChunk?: (chunk: string) => void,
 		options?: { excludeFromContext?: boolean; useUserShell?: boolean; pty?: BashPtyOptions },
 	): Promise<BashResult> {
+		if (this.#exactModelCeiling) {
+			return Promise.reject(new Error("Controlled sessions must use the protected bash adapter"));
+		}
 		return this.#bash.executeBash(command, onChunk, options);
 	}
 
@@ -8883,7 +8914,7 @@ export class AgentSession {
 					if (shouldResetProviderState) {
 						await this.#setModelWithProviderSessionReset(match);
 					} else {
-						this.agent.setModel(match);
+						this.agent.setModel(this.#disableAuxiliaryModels ? removeAuxiliaryModelRoutes(match) : match);
 					}
 				}
 			}
@@ -9014,7 +9045,9 @@ export class AgentSession {
 			let modelRolledBack = false;
 			if (previousModel) {
 				const rolledBackModel = this.model;
-				this.agent.setModel(previousModel);
+				this.agent.setModel(
+					this.#disableAuxiliaryModels ? removeAuxiliaryModelRoutes(previousModel) : previousModel,
+				);
 				modelRolledBack = !modelsAreEqual(rolledBackModel, previousModel);
 			}
 			this.#models.restoreThinkingSnapshot(previousThinkingLevel, previousAutoThinking, previousAutoResolvedLevel);
@@ -10341,6 +10374,7 @@ export class AgentSession {
 	 * @returns true when the advisor is actively running after the call.
 	 */
 	setAdvisorEnabled(enabled: boolean): boolean {
+		if (enabled && this.#disableAuxiliaryModels) return false;
 		return this.#advisors.setAdvisorEnabled(enabled);
 	}
 
@@ -10406,8 +10440,9 @@ export class AgentSession {
 		if (!current || !modelsAreEqual(current, boundAtStartup)) return;
 		const refreshed = this.#modelRegistry.find(current.provider, current.id);
 		if (!refreshed || refreshed.contextWindow === current.contextWindow) return;
-		this.agent.setModel(refreshed);
-		await this.#reconcileModelDependentState(current, refreshed);
+		const admittedModel = this.#disableAuxiliaryModels ? removeAuxiliaryModelRoutes(refreshed) : refreshed;
+		this.agent.setModel(admittedModel);
+		await this.#reconcileModelDependentState(current, admittedModel);
 		if (this.#isDisposed) return;
 		this.#emit({ type: "model_changed" });
 	}

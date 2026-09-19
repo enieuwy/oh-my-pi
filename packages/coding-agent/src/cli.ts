@@ -25,6 +25,10 @@ import {
 	VERSION,
 } from "@oh-my-pi/pi-utils/dirs";
 import { fatal, interceptUnhandledRejections } from "@oh-my-pi/pi-utils/postmortem";
+import {
+	activateControlledToolsPolicyFromArgv,
+	CONTROLLED_TOOLS_CAPABILITIES,
+} from "./controlled-tools-policy";
 import { setProcessName } from "@oh-my-pi/pi-utils/process-name";
 import { declareWorkerHostEntry, installWorkerInbox, isWorkerHostSelector } from "@oh-my-pi/pi-utils/worker-host";
 import { BLOB_BROKER_WORKER_ARG } from "./blob-broker/protocol";
@@ -351,8 +355,15 @@ async function runTinyWorker(): Promise<void> {
 export async function runCli(argv: string[]): Promise<void> {
 	let resolvedArgv = argv;
 	try {
+		if (resolvedArgv.includes("--controlled-tools-capabilities")) {
+			if (resolvedArgv.length !== 1) {
+				throw new Error("--controlled-tools-capabilities must be the only argument");
+			}
+			process.stdout.write(`${JSON.stringify(CONTROLLED_TOOLS_CAPABILITIES)}\n`);
+			return;
+		}
+		activateControlledToolsPolicyFromArgv(resolvedArgv, process.cwd());
 		const extracted = extractProfileFlags(resolvedArgv);
-		resolvedArgv = extracted.argv;
 		if (extracted.profile !== undefined) {
 			setProfile(extracted.profile);
 		} else {

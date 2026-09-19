@@ -4,6 +4,7 @@
  * Integrates MCP tool discovery with the custom tools system.
  */
 import { logger } from "@oh-my-pi/pi-utils";
+import type { EffectiveExtensionRoots } from "../capability/types";
 import type { LoadedCustomTool } from "../extensibility/custom-tools/types";
 import { AgentStorage } from "../session/agent-storage";
 import type { AuthStorage } from "../session/auth-storage";
@@ -39,6 +40,16 @@ export interface MCPToolsLoadOptions {
 	cacheStorage?: AgentStorage | null;
 	/** Auth storage used to resolve OAuth credentials before initial MCP connect */
 	authStorage?: AuthStorage;
+	/** Protected config cwd used instead of the active project cwd. */
+	configCwd?: string;
+	/** Exact server names that may load. Enables fail-closed controlled behavior. */
+	serverNames?: readonly string[];
+	/** Exact canonical MCP tool names retained across initial and dynamic loads. */
+	toolNameCeiling?: ReadonlySet<string>;
+	/** Load only the OMP user mcp.json source. */
+	onlyUserConfig?: boolean;
+	/** Session-local extension roots for MCP config discovery. */
+	extensionRoots?: EffectiveExtensionRoots;
 }
 
 async function resolveToolCache(storage: AgentStorage | null | undefined): Promise<MCPToolCache | null> {
@@ -73,8 +84,14 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			enableProjectConfig: options?.enableProjectConfig,
 			filterExa: options?.filterExa,
 			filterBrowser: options?.filterBrowser,
+			configCwd: options?.configCwd,
+			serverNames: options?.serverNames,
+			toolNameCeiling: options?.toolNameCeiling,
+			extensionRoots: options?.extensionRoots,
+			onlyUserConfig: options?.onlyUserConfig,
 		});
 	} catch (error) {
+		if (options?.serverNames) throw error;
 		// If discovery fails entirely, return empty result
 		const message = error instanceof Error ? error.message : String(error);
 		return {
@@ -84,6 +101,12 @@ export async function discoverAndLoadMCPTools(cwd: string, options?: MCPToolsLoa
 			connectedServers: [],
 			exaApiKeys: [],
 		};
+	}
+	if (options?.serverNames && result.errors.size > 0) {
+		await manager.disconnectAll();
+		throw new Error(
+			`Controlled MCP startup failed: ${Array.from(result.errors, ([name, message]) => `${name}: ${message}`).join("; ")}`,
+		);
 	}
 
 	// Convert MCP tools to LoadedCustomTool format

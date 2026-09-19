@@ -53,6 +53,7 @@ export interface ModelControlsHost {
 	promptGeneration(): number;
 	resolveActiveEditMode(): EditMode;
 	syncAfterModelChange(previousEditMode: EditMode): Promise<void>;
+	assertModelAllowed(model: Model): void;
 	setModelWithProviderSessionReset(model: Model): Promise<void>;
 	clearActiveRetryFallback(): void;
 	clearInheritedProviderPromptCacheKey(): void;
@@ -69,6 +70,7 @@ export class ModelControls {
 	#thinkingLevel: ThinkingLevel | undefined;
 	/** Hard per-session effort ceiling (e.g. a task spawn's `task.maxEffort` cap); recovery paths re-clamp to it. */
 	readonly #thinkingLevelCeiling: Effort | undefined;
+	readonly #disableAutoThinking: boolean;
 	#autoThinking = false;
 	#autoResolvedLevel: Effort | undefined;
 	#serviceTierByFamily: ServiceTierByFamily;
@@ -79,6 +81,7 @@ export class ModelControls {
 			scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 			thinkingLevel?: ConfiguredThinkingLevel;
 			thinkingLevelCeiling?: Effort;
+			disableAutoThinking?: boolean;
 			serviceTierByFamily?: ServiceTierByFamily;
 		},
 	) {
@@ -86,7 +89,11 @@ export class ModelControls {
 		this.#scopedModels = options.scopedModels ?? [];
 		this.#serviceTierByFamily = options.serviceTierByFamily ?? {};
 		this.#thinkingLevelCeiling = options.thinkingLevelCeiling;
-		if (options.thinkingLevel === AUTO_THINKING) {
+		this.#disableAutoThinking = options.disableAutoThinking === true;
+		const thinkingLevel = this.#disableAutoThinking && options.thinkingLevel === AUTO_THINKING
+			? resolveProvisionalAutoLevel(this.#model)
+			: options.thinkingLevel;
+		if (thinkingLevel === AUTO_THINKING) {
 			// Keep auto pending until the first turn while exposing a valid wire effort.
 			this.#autoThinking = true;
 			this.#thinkingLevel = clampThinkingLevelToCeiling(
@@ -97,7 +104,7 @@ export class ModelControls {
 		} else {
 			this.#thinkingLevel = clampThinkingLevelToCeiling(
 				this.#model,
-				options.thinkingLevel,
+				thinkingLevel,
 				this.#thinkingLevelCeiling,
 			);
 		}
@@ -221,6 +228,7 @@ export class ModelControls {
 			persist?: boolean;
 		},
 	): Promise<{ switched: boolean }> {
+		this.#host.assertModelAllowed(model);
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		if (!this.#host.modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -266,6 +274,7 @@ export class ModelControls {
 		thinkingLevel?: ConfiguredThinkingLevel,
 		options?: { ephemeral?: boolean },
 	): Promise<void> {
+		this.#host.assertModelAllowed(model);
 		const previousEditMode = this.#host.resolveActiveEditMode();
 		if (!this.#host.modelRegistry.hasConfiguredAuth(model)) {
 			throw new Error(`No API key for ${model.provider}/${model.id}`);
@@ -504,6 +513,7 @@ export class ModelControls {
 	 */
 	setThinkingLevel(level: ConfiguredThinkingLevel | undefined, persist: boolean = false): void {
 		if (level === AUTO_THINKING) {
+			if (this.#disableAutoThinking) throw new Error("Controlled sessions cannot enable auto thinking");
 			const provisional = clampThinkingLevelToCeiling(
 				this.#model,
 				resolveProvisionalAutoLevel(this.#model),
@@ -572,7 +582,7 @@ export class ModelControls {
 
 		const levels: ConfiguredThinkingLevel[] = [
 			ThinkingLevel.Off,
-			AUTO_THINKING,
+			...(this.#disableAutoThinking ? [] : [AUTO_THINKING]),
 			...this.getAvailableThinkingLevels(),
 		];
 		const configured = this.configuredThinkingLevel();
@@ -596,6 +606,7 @@ export class ModelControls {
 	 * Never throws into the turn, and never clears `#autoThinking`.
 	 */
 	async applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
+		if (this.#disableAutoThinking) return;
 		const model = this.#model;
 		if (!model?.reasoning) return;
 		// Models with reasoning but no controllable effort surface (devin-agent

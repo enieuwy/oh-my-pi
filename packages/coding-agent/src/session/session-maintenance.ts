@@ -267,6 +267,8 @@ export interface SessionMaintenanceHost {
 	providerSessionState: Map<string, ProviderSessionState>;
 	preferWebsockets: boolean | undefined;
 	model(): Model | undefined;
+	prepareCompactionModel?(model: Model): Model | undefined;
+	disableRemoteCompaction?: boolean;
 	thinkingLevel(): ThinkingLevel | undefined;
 	isDisposed(): boolean;
 	isStreaming(): boolean;
@@ -2227,6 +2229,8 @@ export class SessionMaintenance {
 
 		const addCandidate = (model: Model | undefined): void => {
 			if (!model) return;
+			if (this.#host.prepareCompactionModel) model = this.#host.prepareCompactionModel(model);
+			if (!model) return;
 			const key = `${model.provider}/${model.id}`;
 			if (seen.has(key)) return;
 			seen.add(key);
@@ -2278,12 +2282,23 @@ export class SessionMaintenance {
 		options?: SummaryOptions,
 		precomputedCandidates?: Model[],
 	): Promise<CompactionResult> {
+		if (this.#host.disableRemoteCompaction) {
+			// Controlled sessions summarize through the guarded same-model transport.
+			preparation = {
+				...preparation,
+				settings: { ...preparation.settings, remoteEnabled: false, remoteEndpoint: undefined },
+			};
+		}
 		const candidates =
 			precomputedCandidates ?? this.#getCompactionModelCandidates(this.#host.modelRegistry.getAvailable());
 		const telemetry = resolveTelemetry(this.#host.agent.telemetry, this.#host.sessionId());
 		let nativeCompactionFailure: { error: NativeCompactionError; provider: string } | undefined;
 
-		for (const candidate of candidates) {
+		for (const unfilteredCandidate of candidates) {
+			const candidate = this.#host.prepareCompactionModel
+				? this.#host.prepareCompactionModel(unfilteredCandidate)
+				: unfilteredCandidate;
+			if (!candidate) continue;
 			const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
 			if (!apiKey) continue;
 			if (
