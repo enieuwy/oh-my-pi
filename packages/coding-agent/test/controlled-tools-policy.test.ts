@@ -254,7 +254,7 @@ describe("controlled tools policy", () => {
 		removeSyncWithRetries(tempDir);
 	});
 
-	test("refuses a missing adapter and every later model switch", async () => {
+	test("refuses a missing adapter and keeps model restrictions during continuation", async () => {
 		const tempDir = path.join(os.tmpdir(), `omp-controlled-refusal-${Snowflake.next()}`);
 		fs.mkdirSync(tempDir, { recursive: true });
 		await expect(
@@ -263,6 +263,12 @@ describe("controlled tools policy", () => {
 				controlledPolicy: policy({ tools: ["read", "bash"] }),
 			}),
 		).rejects.toThrow("Controlled tools unavailable: bash");
+		const policyPath = path.join(tempDir, "policy.json");
+		fs.writeFileSync(policyPath, JSON.stringify(policy()));
+		activateControlledToolsPolicyFromArgv(
+			["--controlled-tools-policy", policyPath, "--print", "--continue"],
+			tempDir,
+		);
 		const result = await withControlledSession(tempDir);
 		try {
 			await expect(result.session.setModelTemporary({ ...model, id: "forbidden-model" })).rejects.toThrow();

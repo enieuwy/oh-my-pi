@@ -258,6 +258,7 @@ const CONTROLLED_BOOLEAN_FLAGS = new Set([
 	"--auto-approve",
 	"--yolo",
 	"--no-skills",
+	"--continue",
 ]);
 
 function validateControlledArgv(argv: readonly string[]): void {
