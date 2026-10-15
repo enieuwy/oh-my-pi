@@ -13,6 +13,7 @@ import { getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
 import { Args, Command, Flags } from "@oh-my-pi/pi-utils/cli";
 import { sayHelp as commandHelp } from "../cli/command-help";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
 import { ModelRegistry } from "../config/model-registry";
 import { Settings } from "../config/settings";
 import { discoverAuthStorage } from "../sdk";
@@ -53,7 +54,19 @@ export default class Say extends Command {
 		}
 
 		const settings = await Settings.init({ cwd: getProjectDir() });
-		const model = flags.model ?? (await this.#resolveDefaultModel(settings));
+		let model: string;
+		try {
+			model = flags.model ?? (await this.#resolveDefaultModel(settings));
+		} catch (error) {
+			process.stderr.write(chalk.red(`error: ${error instanceof Error ? error.message : String(error)}\n`));
+			process.exit(1);
+		}
+		// An explicit `--model` bypasses role resolution, so it is checked here.
+		const deniedRule = disabledModelRule({ provider: "local", id: model }, settings);
+		if (deniedRule) {
+			process.stderr.write(chalk.red(`error: ${formatDisabledModelError(`local/${model}`, deniedRule)}\n`));
+			process.exit(1);
+		}
 		const voice = flags.voice ?? cfgTtsLocalVoice.get(settings);
 		const speed = flags.speed === undefined ? cfgTtsLocalSpeed.get(settings) : Number(flags.speed);
 		if (!Number.isFinite(speed) || speed <= 0) {

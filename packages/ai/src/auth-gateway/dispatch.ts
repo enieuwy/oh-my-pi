@@ -13,7 +13,7 @@ import type { AuthApiKeyOptions, AuthStorage } from "../auth-storage";
 import * as AIError from "../error";
 import { classifyGatewayError, type GatewayErrorClassification } from "../error/gateway";
 import { isUsageLimitOutcome } from "../error/rate-limit";
-import type { Api, FetchImpl, Model, Usage } from "../types";
+import type { Api, FetchImpl, Model, SimpleStreamOptions, Usage } from "../types";
 import type { ClientUsageIdentity } from "../usage";
 import { extractProviderRetryHint } from "../utils/retry-after";
 import type { AuthGatewayServerOptions } from "./types";
@@ -30,6 +30,21 @@ export interface AuthGatewayRouteOptions {
 	 * dependency in `pi-ai`).
 	 */
 	resolveModel: ModelResolver;
+	/**
+	 * Explain why a model id that `resolveModel` did not resolve is refused rather than unknown
+	 * (the host denies a model that exists). Returns the message the client sees, or `undefined`
+	 * when the id is simply unknown.
+	 */
+	modelRefusal?: (modelId: string) => string | undefined;
+	/**
+	 * Explain why a resolved model is refused under the client's routing options (an OpenRouter
+	 * variant, a thinking effort that routes to another wire id). Runs before any credential is
+	 * resolved; returns the message the client sees as a `403`, or `undefined` to serve.
+	 */
+	requestRefusal?: (
+		model: Model<Api>,
+		options: Pick<SimpleStreamOptions, "reasoning" | "disableReasoning" | "forceReasoningOff" | "openrouterVariant">,
+	) => string | undefined;
 	/** Optional supplier for `/v1/models` listing. Returns the full model array. */
 	listModels?: () => Iterable<Model<Api>>;
 	/** Providers the host does not serve; `/v1/usage` and `/v1/credentials/check` leave their accounts out. */
@@ -40,6 +55,27 @@ export interface AuthGatewayRouteOptions {
 
 /** The HTTP server's options: the routes' plus its listener and inbound auth. */
 export interface AuthGatewayBootOptions extends AuthGatewayServerOptions, AuthGatewayRouteOptions {}
+
+/** The error a route answers with when `resolveModel` returned no model. */
+export interface UnresolvedModelRejection {
+	status: number;
+	type: string;
+	message: string;
+}
+
+/**
+ * Classify an unresolved model id: `403 permission_error` carrying the host's reason when
+ * `modelRefusal` names one (the model exists but is denied), else `404 invalid_request_error`
+ * for an unknown model.
+ */
+export function rejectUnresolvedModel(
+	opts: Pick<AuthGatewayRouteOptions, "modelRefusal">,
+	modelId: string,
+): UnresolvedModelRejection {
+	const refusal = opts.modelRefusal?.(modelId);
+	if (refusal !== undefined) return { status: 403, type: "permission_error", message: refusal };
+	return { status: 404, type: "invalid_request_error", message: `Unknown model: ${modelId}` };
+}
 
 /**
  * The client's own session key, or `undefined` when it sent none. A blank key

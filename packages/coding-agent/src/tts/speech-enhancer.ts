@@ -18,6 +18,7 @@
 import { type AssistantMessage, completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
+import { formatDisabledModelError } from "../config/disabled-models";
 import { roleCandidatePool } from "../config/model-roles";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -74,11 +75,20 @@ export class SpeechEnhancer {
 			// `@tiny` expands a configured `modelRoles.tiny` and otherwise falls
 			// through tiny's alias to the smol priority chain — unlike bare role
 			// lookup, this resolves even with no roles configured.
-			const model = resolveModelRoleValue("@tiny", roleCandidatePool("tiny", settings, registry), {
+			const resolved = resolveModelRoleValue("@tiny", roleCandidatePool("tiny", settings, registry), {
 				settings,
 				matchPreferences: getModelMatchPreferences(settings),
-			}).model;
-			if (!model) return null;
+			});
+			const model = resolved.model;
+			if (!model) {
+				// A configured `tiny` role that names only denied models is refused, not replaced by another model.
+				if (resolved.disabledModel) {
+					logger.warn("Speech rewrite skipped", {
+						reason: formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule),
+					});
+				}
+				return null;
+			}
 			const apiKey = await registry.getApiKey(model, sessionId);
 			if (!apiKey) return null;
 			// Resolve metadata after getApiKey so the session-sticky credential is recorded first.

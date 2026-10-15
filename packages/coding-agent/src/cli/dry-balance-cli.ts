@@ -16,6 +16,7 @@ import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 import { SPINNER_FRAMES } from "@oh-my-pi/pi-tui/theme/symbols";
 import { formatDuration, getProjectDir } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import { formatDisabledModelError } from "../config/disabled-models";
 import { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
@@ -575,6 +576,11 @@ async function resolveDryBalanceModel(
 		settings,
 		matchPreferences: preferences,
 	});
+	if (defaultRoleSpec.disabledModel) {
+		throw new Error(
+			formatDisabledModelError(defaultRoleSpec.disabledModel.label, defaultRoleSpec.disabledModel.rule),
+		);
+	}
 	if (defaultRoleSpec.model) {
 		return { model: defaultRoleSpec.model, warning: defaultRoleSpec.warning };
 	}

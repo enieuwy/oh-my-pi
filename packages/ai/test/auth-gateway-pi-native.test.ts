@@ -325,6 +325,65 @@ describe("pi-native gateway reasoning flags", () => {
 	});
 });
 
+describe("pi-native gateway request refusal", () => {
+	it("refuses with 403 from the routing options before any provider call", async () => {
+		registerMockApi();
+		const dir = await fs.mkdtemp(path.join(os.tmpdir(), "gw-pi-native-refusal-"));
+		const storage = await AuthStorage.create(path.join(dir, "auth.db"));
+		storage.keys.setRuntime("openrouter", "test-key");
+		const mock = createMockModel({ provider: "openrouter", id: "pi-native-refusal" });
+		const seen: Array<string | undefined> = [];
+		const handle = startAuthGateway({
+			bind: "127.0.0.1:0",
+			bearerTokens: ["test-token"],
+			storage,
+			resolveModel: () => mock,
+			requestRefusal: (_model, options) => {
+				seen.push(options.openrouterVariant);
+				if (options.reasoning === "high") return "effort high is denied";
+				return options.openrouterVariant === "floor" ? "variant floor is denied" : undefined;
+			},
+			version: "test",
+		});
+
+		try {
+			mock.push({ content: ["ok"] });
+			const post = (options: Record<string, unknown>) =>
+				fetch(`${handle.url}/v1/pi/stream`, {
+					method: "POST",
+					headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+					body: JSON.stringify({ modelId: "pi-native-refusal", context: baseContext, options, stream: false }),
+				});
+			const refused = await post({ openrouterVariant: "floor" });
+			expect(refused.status).toBe(403);
+			expect(JSON.stringify(await refused.json())).toContain("variant floor is denied");
+			expect(mock.calls).toHaveLength(0);
+			const served = await post({});
+			expect(served.status).toBe(200);
+			expect(mock.calls).toHaveLength(1);
+			expect(seen).toEqual(["floor", undefined]);
+			// The chat-completions route resolves its options the same way, so effort routing is checked there too.
+			const chat = await fetch(`${handle.url}/v1/chat/completions`, {
+				method: "POST",
+				headers: { Authorization: "Bearer test-token", "Content-Type": "application/json" },
+				body: JSON.stringify({
+					model: "pi-native-refusal",
+					messages: [{ role: "user", content: "hi" }],
+					reasoning_effort: "high",
+				}),
+			});
+			expect(chat.status).toBe(403);
+			expect(JSON.stringify(await chat.json())).toContain("effort high is denied");
+			expect(mock.calls).toHaveLength(1);
+		} finally {
+			await handle.close();
+			storage.close();
+			await fs.rm(dir, { recursive: true, force: true });
+			clearCustomApis();
+		}
+	});
+});
+
 describe("pi-native gateway usage attribution", () => {
 	it("records observed usage under the caller's x-omp-* identity, host-fallback when absent", async () => {
 		registerMockApi();

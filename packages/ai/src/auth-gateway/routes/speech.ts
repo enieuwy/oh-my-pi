@@ -8,6 +8,7 @@ import {
 	buildGatewayApiKeyResolver,
 	mirrorRequestAbort,
 	recordGatewayUsage,
+	rejectUnresolvedModel,
 	resolveGatewayApiKey,
 } from "../dispatch";
 import { gatewayResponseHeaders, resolveClientIdentity } from "../http";
@@ -37,7 +38,10 @@ export async function handleSpeech(bootOpts: AuthGatewayRouteOptions, req: Reque
 	}
 
 	const model = bootOpts.resolveModel(parsed.modelId);
-	if (!model) return speechWire.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+	if (!model) {
+		const rejection = rejectUnresolvedModel(bootOpts, parsed.modelId);
+		return speechWire.formatError(rejection.status, rejection.type, rejection.message);
+	}
 	if (!isSpeechApi(model.api)) {
 		const route =
 			model.kind === "image"

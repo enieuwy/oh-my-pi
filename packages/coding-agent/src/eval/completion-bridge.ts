@@ -19,8 +19,10 @@ import { clampThinkingLevelForModel, getSupportedEfforts } from "@oh-my-pi/pi-ca
 import { Snowflake } from "@oh-my-pi/pi-utils";
 import { extractTextContent, extractToolCall, parseJsonPayload } from "../commit/utils";
 
+import { disabledModelRule, formatDisabledModelError, withoutDisabledModels } from "../config/disabled-models";
 import type { ModelRegistry } from "../config/model-registry";
 import {
+	configuredRoleDenial,
 	expandRoleAlias,
 	extractExplicitThinkingSelector,
 	formatModelString,
@@ -28,6 +30,7 @@ import {
 	getModelMatchPreferences,
 	resolveModelFromString,
 	resolveModelOverride,
+	resolveModelRoleValue,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { MAIN_AGENT_ID } from "../registry/agent-registry";
@@ -222,7 +225,13 @@ function appendFallbackCandidates(
 	})) {
 		const resolved = resolveModelOverride([entry.raw], deps.modelRegistry, deps.settings);
 		const candidate = resolved.model;
-		if (!candidate || deps.disabledProviders.has(candidate.provider)) continue;
+		if (
+			!candidate ||
+			deps.disabledProviders.has(candidate.provider) ||
+			disabledModelRule(candidate, deps.settings) !== undefined
+		) {
+			continue;
+		}
 		const reasoning = reasoningForCandidate(deps.tier, candidate, entry.thinkingLevel, parent);
 		const identity = candidateIdentity(candidate, reasoning);
 		if (seen.has(identity)) continue;
@@ -239,7 +248,7 @@ function appendFallbackCandidates(
 function resolveTierCandidates(tier: CompletionTier, session: ToolSession): CompletionCandidate[] {
 	const modelRegistry = session.modelRegistry;
 	if (!modelRegistry) return [];
-	const available = modelRegistry.getAvailable();
+	const available = withoutDisabledModels(modelRegistry.getAvailable(), session.settings);
 	if (available.length === 0) return [];
 
 	const matchPreferences = getModelMatchPreferences(session.settings);
@@ -248,6 +257,11 @@ function resolveTierCandidates(tier: CompletionTier, session: ToolSession): Comp
 	): { model: Model<Api>; selector: string; configuredEffort?: ConfiguredThinkingLevel } | undefined => {
 		if (!pattern) return undefined;
 		const selector = expandRoleAlias(pattern, session.settings);
+		// Refuse a selector that names a denied model before fuzzy matching can pick a sibling.
+		const role = resolveModelRoleValue(selector, available, { settings: session.settings, matchPreferences });
+		if (!role.model && role.disabledModel) {
+			throw new ToolError(formatDisabledModelError(role.disabledModel.label, role.disabledModel.rule));
+		}
 		const model = resolveModelFromString(selector, available, matchPreferences);
 		if (!model) return undefined;
 		const configuredEffort =
@@ -271,7 +285,12 @@ function resolveTierCandidates(tier: CompletionTier, session: ToolSession): Comp
 		tier === "default"
 			? (resolve(session.getActiveModelString?.() ?? session.getModelString?.()) ?? resolve(TIER_TO_PATTERN.default))
 			: resolve(TIER_TO_PATTERN[tier]);
-	if (!primary) return [];
+	if (!primary) {
+		// A configured role that names only denied models is refused, not replaced by another model.
+		const denied = configuredRoleDenial(TIER_TO_PATTERN[tier].slice(1), session.settings, available);
+		if (denied) throw new ToolError(formatDisabledModelError(denied.label, denied.rule));
+		return [];
+	}
 
 	const candidates: CompletionCandidate[] = [
 		{

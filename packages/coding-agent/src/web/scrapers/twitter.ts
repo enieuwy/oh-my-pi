@@ -1,5 +1,6 @@
 import { prompt } from "@oh-my-pi/pi-utils";
-import { settings } from "../../config/settings";
+import { disabledModelRule, formatDisabledModelError, withoutDisabledModels } from "../../config/disabled-models";
+import { settings as globalSettings } from "../../config/settings";
 import xReadPrompt from "../../prompts/system/x-read.md" with { type: "text" };
 import { ToolAbortError } from "../../tools/tool-errors";
 import { SEARCH_HARD_TIMEOUT_MS } from "../search/providers/utils";
@@ -59,7 +60,8 @@ function unavailable(url: string, fetchedAt: string, reason: string): RenderResu
  * scraping. Needs `xai-oauth` or `xai` credentials; tries the models of
  * {@link xaiModelChain} in order until one answers.
  */
-export const handleTwitter: SpecialHandler = async (url, timeout, signal, _storage, modelRegistry) => {
+export const handleTwitter: SpecialHandler = async (url, timeout, signal, _storage, modelRegistry, sessionSettings) => {
+	const settings = sessionSettings ?? globalSettings;
 	const target = parseXUrl(url);
 	if (!target) return null;
 	const fetchedAt = new Date().toISOString();
@@ -70,7 +72,7 @@ export const handleTwitter: SpecialHandler = async (url, timeout, signal, _stora
 			"X blocks automated access, and Grok's X tools only read posts, profiles, post searches, and hashtags.",
 		);
 	}
-	const models = modelRegistry ? xaiModelChain(modelRegistry, settings) : [];
+	const models = modelRegistry ? withoutDisabledModels(xaiModelChain(modelRegistry, settings), settings) : [];
 	if (!modelRegistry || models.length === 0) {
 		return unavailable(
 			url,
@@ -85,6 +87,12 @@ export const handleTwitter: SpecialHandler = async (url, timeout, signal, _stora
 		target.kind === "profile" ? { type: "x_search", allowed_x_handles: [target.handle] } : { type: "x_search" };
 	const failures: string[] = [];
 	for (const model of models) {
+		// Final check against the requesting session's rules, ahead of credential resolution.
+		const rule = disabledModelRule(model, settings);
+		if (rule !== undefined) {
+			failures.push(formatDisabledModelError(model, rule));
+			continue;
+		}
 		try {
 			const { response } = await requestXAIResponses(
 				{

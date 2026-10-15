@@ -17,6 +17,7 @@ import { AUTO_THINKING, type ConfiguredThinkingLevel, parseConfiguredThinkingLev
 import { isRecord } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import { cfgDefaultThinkingLevel } from "../session/settings";
+import { formatDisabledModelError } from "./disabled-models";
 import { pickDefaultAvailableModel, resolveModelRoleValue } from "./model-resolver";
 import { cfgModelPresets, cfgModelRoleStorage, type ModelPreset } from "./model-settings";
 import type { Settings, SettingProvenance } from "./settings";
@@ -247,7 +248,11 @@ function resolveLiveDefault(
 		return model ? { model, thinkingLevel: fallbackLevel } : "no model with configured credentials is available";
 	}
 	const resolved = resolveModelRoleValue(roleValue, candidates, { settings });
-	if (!resolved.model) return `default model \`${roleValue}\` is not available`;
+	if (!resolved.model) {
+		return resolved.disabledModel
+			? formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule)
+			: `default model \`${roleValue}\` is not available`;
+	}
 	if (!session.modelRegistry.hasConfiguredAuth(resolved.model)) {
 		return `no credentials for ${resolved.model.provider}/${resolved.model.id}`;
 	}
@@ -351,8 +356,14 @@ async function applyModelPresetLocked(
 				Object.hasOwn(preset.modelRoles, role) ? preset.modelRoles[role] : settings.getModelRole(role),
 		};
 		const resolved = resolveModelRoleValue(presetDefault, candidates, { settings, roleLookup });
-		if (!resolved.model)
-			return { kind: "unavailable", reason: `default model \`${presetDefault}\` is not available` };
+		if (!resolved.model) {
+			return {
+				kind: "unavailable",
+				reason: resolved.disabledModel
+					? formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule)
+					: `default model \`${presetDefault}\` is not available`,
+			};
+		}
 		if (!session.modelRegistry.hasConfiguredAuth(resolved.model)) {
 			return {
 				kind: "unavailable",

@@ -39,6 +39,7 @@ import {
 	type Skill,
 	type SkillPromptInput,
 } from "../../extensibility/skills";
+import { disabledModelRule, formatDisabledModelError } from "../../config/disabled-models";
 import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
 import { AgentLifecycleManager } from "../../registry/agent-lifecycle";
 import {
@@ -944,7 +945,15 @@ export async function openRpcSession(
 	};
 }
 
-type RpcModelLookupSession = Pick<AgentSession, "getAvailableModels" | "modelRegistry">;
+type RpcModelLookupSession = Pick<AgentSession, "getAvailableModels" | "modelRegistry" | "settings">;
+
+/** Why `provider/modelId` is not selectable: the `disabledModels` diagnostic when a rule denies it, else "not found". */
+function rpcModelMissingMessage(session: RpcModelLookupSession, provider: string, modelId: string): string {
+	const rule = disabledModelRule({ provider, id: modelId }, session.settings);
+	return rule === undefined
+		? `Model not found: ${provider}/${modelId}`
+		: formatDisabledModelError(`${provider}/${modelId}`, rule);
+}
 
 /**
  * The available model with exactly this provider and id. Models missing from
@@ -970,7 +979,7 @@ async function resolveRequestedRpcModel(
 	if (provider === undefined && modelId === undefined) return undefined;
 	if (provider === undefined || modelId === undefined) throw new Error("provider and modelId must be given together");
 	const model = await findRpcModel(session, provider, modelId);
-	if (!model) throw new Error(`Model not found: ${provider}/${modelId}`);
+	if (!model) throw new Error(rpcModelMissingMessage(session, provider, modelId));
 	return model;
 }
 
@@ -2270,7 +2279,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			case "set_model": {
 				const model = await findRpcModel(session, command.provider, command.modelId);
 				if (!model) {
-					return error(id, "set_model", `Model not found: ${command.provider}/${command.modelId}`);
+					return error(id, "set_model", rpcModelMissingMessage(session, command.provider, command.modelId));
 				}
 				await session.setModel(model);
 				return success(id, "set_model", model);

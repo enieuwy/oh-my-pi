@@ -8,6 +8,7 @@
 import type { type as ArkType } from "@oh-my-pi/omptype";
 import type * as TypeBox from "@oh-my-pi/omptype/typebox";
 import type * as zod from "@oh-my-pi/omptype/zod";
+import type { Settings } from "../../config/settings";
 import type { ExtensionUIContext } from "../extensions/types";
 import type { ExecOptions, ExecResult, HookCommandContext } from "../../extensibility/hooks/types";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
@@ -19,6 +20,8 @@ export type { ExecOptions, ExecResult, HookCommandContext };
 /** Interactive capabilities available to user-invoked commands, not hooks. */
 export interface CustomCommandContext extends HookCommandContext {
 	ui: ExtensionUIContext;
+	/** The session settings, for policy checks such as `disabledModels`. */
+	settings: Settings;
 }
 
 /**

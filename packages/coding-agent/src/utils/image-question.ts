@@ -4,11 +4,18 @@ import { type Api, type AssistantMessage, completeSimple, type Model, type Usage
 import { prompt } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
 import {
+	type DisabledModelSelection,
+	formatDisabledModelError,
+	withoutDisabledModels,
+} from "../config/disabled-models";
+import {
+	configuredRoleDenial,
 	expandRoleAlias,
 	extractExplicitThinkingSelector,
 	getModelMatchPreferences,
 	resolveModelFromString,
 } from "../config/model-resolver";
+import type { Settings } from "../config/settings";
 import imageQuestionSystemPromptTemplate from "../prompts/tools/image-question-system.md" with { type: "text" };
 import { concreteThinkingLevel, resolveThinkingLevelForModel, toReasoningEffort } from "@oh-my-pi/pi-tui/thinking";
 import type { ToolSession } from "../tools";
@@ -31,6 +38,22 @@ export interface ImageQuestionResult {
 	usage: Usage;
 }
 
+/**
+ * Walk the vision roles in selection order (`@vision`, then `@default`). The first
+ * configured role that resolves only to denied models is refused; a role that already
+ * serves an image-capable model ends the walk, so a later denied role is never reached.
+ */
+export function visionRoleDenial(settings: Settings, available: Model<Api>[]): DisabledModelSelection | undefined {
+	const matchPreferences = getModelMatchPreferences(settings);
+	for (const role of ["vision", "default"]) {
+		const denied = configuredRoleDenial(role, settings, available);
+		if (denied) return denied;
+		const served = resolveModelFromString(expandRoleAlias(`@${role}`, settings), available, matchPreferences);
+		if (served && sendsImageInputOnWire(served)) return undefined;
+	}
+	return undefined;
+}
+
 /** Resolve the vision model used by `read <image>?q=<question>`. */
 export function resolveImageQuestionModel(session: ToolSession): ResolvedImageQuestionModel {
 	const modelRegistry = session.modelRegistry;
@@ -38,7 +61,9 @@ export function resolveImageQuestionModel(session: ToolSession): ResolvedImageQu
 		throw new ToolError("Model registry is unavailable for image questions.");
 	}
 
-	const availableModels = modelRegistry.getAvailable();
+	const availableModels = withoutDisabledModels(modelRegistry.getAvailable(), session.settings);
+	const denied = visionRoleDenial(session.settings, availableModels);
+	if (denied) throw new ToolError(formatDisabledModelError(denied.label, denied.rule));
 	if (availableModels.length === 0) {
 		throw new ToolError("No models available for image questions.");
 	}

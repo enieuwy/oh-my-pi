@@ -3,6 +3,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { AutocompleteItem } from "@oh-my-pi/pi-tui";
 import { getMCPConfigPath, getProjectDir, logger } from "@oh-my-pi/pi-utils";
+import { withSessionDisabledModels } from "../config/disabled-models";
 import { formatModelRoleAlias, getKnownRoleIds } from "../config/model-roles";
 import { cfgCycleOrder } from "../config/model-settings";
 import { readMCPConfigFile } from "../mcp/config-writer";
@@ -300,7 +301,7 @@ export function buildModelSelectorCompletions(
 				source: createModelBrowserSource(runtime.ctx.settings, model =>
 					runtime.ctx.session.effectiveServiceTier(model),
 				),
-				registry: runtime.ctx.session.modelRegistry,
+				registry: withSessionDisabledModels(runtime.ctx.session.modelRegistry, runtime.ctx.settings),
 				scopedModels: () => runtime.ctx.session.scopedModels.map(entry => entry.model),
 			});
 			for (const { selector, model } of rankModels(query)) {

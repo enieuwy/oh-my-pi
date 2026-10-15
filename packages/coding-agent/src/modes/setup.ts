@@ -8,6 +8,7 @@ import {
 	selectSetupScenes as selectScenes,
 	type SetupSceneSelectionOptions,
 } from "@oh-my-pi/pi-tui/setup/wizard";
+import { withoutDisabledModels } from "../config/disabled-models";
 import type { Settings } from "../config/settings";
 import { captureBrowserSession } from "../utils/browser-session";
 import { copyToClipboard } from "../utils/clipboard";
@@ -53,8 +54,8 @@ export function createSetupHost(ctx: InteractiveModeContext): SetupHost {
 		},
 		modelSource,
 		getModels: () => ({
-			available: ctx.session.modelRegistry.getAvailable("all"),
-			all: ctx.session.modelRegistry.getAll("all"),
+			available: withoutDisabledModels(ctx.session.modelRegistry.getAvailable("all"), ctx.settings),
+			all: withoutDisabledModels(ctx.session.modelRegistry.getAll("all"), ctx.settings),
 			current: ctx.session.model,
 		}),
 		refreshModels: () => ctx.session.modelRegistry.refresh("online-if-uncached"),

@@ -1,14 +1,18 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { AuthStorage } from "@oh-my-pi/pi-ai";
-import { getBundledModels } from "@oh-my-pi/pi-catalog/models";
+import { getBundledModel, getBundledModels } from "@oh-my-pi/pi-catalog/models";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { TempDir } from "@oh-my-pi/pi-utils";
 import {
 	createSerializedRebuilder,
+	gatewayListedModels,
+	gatewayModelRefusal,
+	gatewayRequestRefusal,
 	gatewayRoutableModels,
 	gatewayRoutableProviders,
 	indexModelsByRequestId,
 	resolveGatewayModel,
+	resolveServableGatewayModel,
 } from "../../src/cli/auth-gateway-cli";
 import { ModelRegistry } from "../../src/config/model-registry";
 import { Settings } from "../../src/config/settings";
@@ -132,6 +136,39 @@ describe("indexModelsByRequestId (auth-gateway catalog)", () => {
 		expect([...routable].sort()).toEqual(["anthropic"]);
 		expect([...index.values()].some(model => model.provider === "openrouter")).toBe(false);
 		expect([...index.values()].some(model => model.provider === "anthropic")).toBe(true);
+	});
+
+	test("omits disabledModels from /v1/models and refuses to route them, keeping the provider", async () => {
+		const storage = await createAuthStorage();
+		await storage.credentials.set("openai", { type: "api_key", key: "sk-test-openai" });
+		const settings = Settings.isolated({ disabledModels: ["openai/gpt-4o-mini"] });
+		const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
+		const routableProviders = gatewayRoutableProviders(storage, settings);
+		const routable = gatewayRoutableModels(registry).filter(model => routableProviders.has(model.provider));
+		const index = indexModelsByRequestId(routable, routableProviders);
+
+		const listed = gatewayListedModels(routable, settings).map(model => `${model.provider}/${model.id}`);
+		expect(listed).not.toContain("openai/gpt-4o-mini");
+		expect(listed).toContain("openai/gpt-4o");
+		// Provider-wide rows (usage, credential health) key off the routable providers.
+		expect([...routableProviders]).toEqual(["openai"]);
+
+		expect(resolveServableGatewayModel("openai/gpt-4o-mini", index, routable, settings)).toBeUndefined();
+		expect(gatewayModelRefusal("openai/gpt-4o-mini", index, routable, settings)).toBe(
+			'Model "openai/gpt-4o-mini" is disabled by disabledModels rule "openai/gpt-4o-mini". Remove or narrow that rule to use it.',
+		);
+		expect(resolveServableGatewayModel("openai/gpt-4o", index, routable, settings)?.id).toBe("gpt-4o");
+		expect(gatewayModelRefusal("openai/no-such-model", index, routable, settings)).toBeUndefined();
+	});
+
+	test("refuses a servable base model whose request options route to a denied identity", () => {
+		const variantModel = getBundledModel("openrouter", "openai/gpt-4o");
+		if (!variantModel) throw new Error("bundled model missing");
+		const settings = Settings.isolated({ disabledModels: ["openrouter/openai/gpt-4o:floor"] });
+		expect(gatewayRequestRefusal(variantModel, {}, settings)).toBeUndefined();
+		expect(gatewayRequestRefusal(variantModel, { openrouterVariant: "floor" }, settings)).toBe(
+			'Model "openrouter/openai/gpt-4o:floor" is disabled by disabledModels rule "openrouter/openai/gpt-4o:floor". Remove or narrow that rule to use it.',
+		);
 	});
 
 	test("serves judge-kind models alongside chat and keeps unrouted kinds out", async () => {

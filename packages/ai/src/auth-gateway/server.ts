@@ -48,6 +48,7 @@ import {
 	mirrorRequestAbort,
 	normalizeClientSessionKey,
 	recordGatewayUsage,
+	rejectUnresolvedModel,
 	resolveGatewayAccount,
 	resolveGatewayApiKey,
 } from "./dispatch";
@@ -293,7 +294,8 @@ async function handleFormatEndpoint(
 
 	const model = bootOpts.resolveModel(modelId);
 	if (!model) {
-		return route.module.formatError(404, "invalid_request_error", `Unknown model: ${modelId}`);
+		const rejection = rejectUnresolvedModel(bootOpts, modelId);
+		return route.module.formatError(rejection.status, rejection.type, rejection.message);
 	}
 	const kindRejection = chatRouteRejection(model);
 	if (kindRejection) return route.module.formatError(400, "invalid_request_error", kindRejection);
@@ -320,6 +322,10 @@ async function handleFormatEndpoint(
 	{
 		const captured = captureRequestHeaders(req.headers);
 		parsed.options.headers = { ...captured, ...parsed.options.headers };
+	}
+	const requestRefusal = bootOpts.requestRefusal?.(model, parsed.options);
+	if (requestRefusal !== undefined) {
+		return route.module.formatError(403, "permission_error", requestRefusal);
 	}
 	if (controller.signal.aborted) return clientClosedResponse(route);
 
@@ -538,10 +544,13 @@ async function handlePiNative(
 
 	const model = bootOpts.resolveModel(parsed.modelId);
 	if (!model) {
-		return piNative.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+		const rejection = rejectUnresolvedModel(bootOpts, parsed.modelId);
+		return piNative.formatError(rejection.status, rejection.type, rejection.message);
 	}
 	const kindRejection = chatRouteRejection(model);
 	if (kindRejection) return piNative.formatError(400, "invalid_request_error", kindRejection);
+	const requestRefusal = bootOpts.requestRefusal?.(model, parsed.options);
+	if (requestRefusal !== undefined) return piNative.formatError(403, "permission_error", requestRefusal);
 	const client = resolveClientIdentity(req.headers);
 	// Pi-native already parsed `streamOpts.sessionId` (when set by the
 	// client); fall back to the derived key so credential-stickiness lines

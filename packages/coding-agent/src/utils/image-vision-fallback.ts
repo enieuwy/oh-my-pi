@@ -23,6 +23,7 @@ import type { Api, completeSimple, ImageContent, Model, TextContent } from "@oh-
 import { logger, prompt, toError } from "@oh-my-pi/pi-utils";
 import { extractTextContent } from "../commit/utils";
 import type { ModelRegistry } from "../config/model-registry";
+import { formatDisabledModelError, withoutDisabledModels } from "../config/disabled-models";
 import { expandRoleAlias, getModelMatchPreferences, resolveModelFromString } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { type LocalProtocolOptions, resolveLocalRoot } from "../internal-urls";
@@ -30,6 +31,7 @@ import { cfgImagesBlockImages } from "../modes/settings";
 import { cfgImagesDescribeForTextModels } from "../session/settings";
 import describeUserPrompt from "../prompts/tools/image-attachment-describe.md" with { type: "text" };
 import describeSystemPrompt from "../prompts/tools/image-attachment-describe-system.md" with { type: "text" };
+import { visionRoleDenial } from "./image-question";
 
 /** Telemetry tag for the oneshot vision-description calls. */
 const ONESHOT_KIND = "image_attachment_describe";
@@ -116,8 +118,7 @@ function formatImageBlock(localUrl: string, description: string): string {
  * (`@vision` → `@default` → active → first image-capable available), but
  * never returning a text-only model.
  */
-function resolveVisionModel(deps: DescribeAttachedImagesDeps): Model<Api> | undefined {
-	const available = deps.modelRegistry.getAvailable();
+function resolveVisionModel(deps: DescribeAttachedImagesDeps, available: Model<Api>[]): Model<Api> | undefined {
 	if (available.length === 0) return undefined;
 	const preferences = getModelMatchPreferences(deps.settings);
 	const resolvePattern = (pattern: string | undefined): Model<Api> | undefined => {
@@ -191,7 +192,9 @@ export async function describeAttachedImagesForTextModel(
 	signal?: AbortSignal,
 ): Promise<TextContent[]> {
 	const localRoot = resolveLocalRoot(deps.localProtocolOptions);
-	const visionModel = resolveVisionModel(deps);
+	const available = withoutDisabledModels(deps.modelRegistry.getAvailable(), deps.settings);
+	const denied = visionRoleDenial(deps.settings, available);
+	const visionModel = denied ? undefined : resolveVisionModel(deps, available);
 	const apiKey = visionModel ? await deps.modelRegistry.getApiKey(visionModel, deps.sessionId) : undefined;
 	const canDescribe = Boolean(visionModel && apiKey);
 	const telemetry = resolveTelemetry(deps.telemetryConfig, deps.sessionId);
@@ -203,6 +206,8 @@ export async function describeAttachedImagesForTextModel(
 			if (canDescribe && visionModel) {
 				description =
 					(await describeImage(image, visionModel, deps, telemetry, signal)) ?? DESCRIPTION_UNAVAILABLE_NOTE;
+			} else if (denied) {
+				description = `[Image description refused: ${formatDisabledModelError(denied.label, denied.rule)}]`;
 			} else {
 				description = NO_VISION_MODEL_NOTE;
 			}

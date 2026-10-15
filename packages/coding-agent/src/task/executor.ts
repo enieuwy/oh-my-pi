@@ -147,6 +147,7 @@ import {
 	cfgDefaultThinkingLevel,
 } from "../session/settings";
 import { cfgDisabledProviders } from "../config/model-settings";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
 import { getRetryFallbackRole, installRetryFallbackRole } from "../session/retry-fallback-chains";
 import {
 	cfgCompactionModelThresholdsEnabled,
@@ -258,8 +259,22 @@ function resolveSubagentRetryFallbackCandidates(
 	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	for (const pattern of modelPatterns) {
 		const resolved = resolveModelOverride([pattern], modelRegistry, settings);
-		if (!resolved.model) continue;
+		if (!resolved.model) {
+			// A denied fallback is skipped like an unavailable one; the warning names the rule.
+			if (resolved.disabledModel) {
+				logger.warn("Subagent fallback model skipped", { pattern, warning: resolved.warning });
+			}
+			continue;
+		}
 		if (disabledProviders.has(resolved.model.provider)) continue;
+		const deniedBy = disabledModelRule(resolved.model, settings);
+		if (deniedBy !== undefined) {
+			logger.warn("Subagent fallback model skipped", {
+				pattern,
+				warning: formatDisabledModelError(resolved.model, deniedBy),
+			});
+			continue;
+		}
 		const selector = resolved.explicitThinkingLevel
 			? formatModelSelectorValue(formatModelStringWithRouting(resolved.model), resolved.thinkingLevel)
 			: formatModelStringWithRouting(resolved.model);
@@ -305,7 +320,10 @@ function resolveSubagentInheritedRetryFallbackChain(
 	const disabledProviders = new Set(cfgDisabledProviders.get(settings));
 	return fallbackChain.filter(entry => {
 		const resolved = resolveModelOverride([entry], modelRegistry, settings);
-		return !resolved.model || !disabledProviders.has(resolved.model.provider);
+		return (
+			!resolved.model ||
+			(!disabledProviders.has(resolved.model.provider) && disabledModelRule(resolved.model, settings) === undefined)
+		);
 	});
 }
 
@@ -4217,6 +4235,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 				explicitThinkingLevel,
 				authFallbackUsed,
 				warning: modelResolutionWarning,
+				disabledModel,
 			} = await awaitAbortable(
 				resolveModelOverrideWithAuthFallback(
 					modelPatterns,
@@ -4226,6 +4245,12 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 					id,
 				),
 			);
+			// A requested model (task override, agent frontmatter, extension replacement)
+			// that resolves only to a denied model is refused; never fall back to the parent
+			// model, which would hide the rule.
+			if (!model && disabledModel) {
+				throw new Error(formatDisabledModelError(disabledModel.label, disabledModel.rule));
+			}
 			if (modelResolutionWarning) {
 				logger.warn("Subagent model resolution warning", {
 					warning: modelResolutionWarning,

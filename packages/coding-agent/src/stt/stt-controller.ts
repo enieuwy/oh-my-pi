@@ -4,7 +4,8 @@ import type { Api, Model } from "@oh-my-pi/pi-catalog/types";
 import { AudioCapture } from "@oh-my-pi/pi-natives";
 import type { ModelBrowserRegistry } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { logger } from "@oh-my-pi/pi-utils";
-import { resolveRoleChain } from "../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
+import { configuredRoleDenial, resolveRoleChain } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { type Settings, settings } from "../config/settings";
 import { type SttStreamHandle, sttClient } from "./asr-client";
@@ -154,14 +155,30 @@ export class STTController {
 		}
 	}
 
-	#resolveModel(): Model<Api> | undefined {
+	/**
+	 * The dictation model, or null (after warning) when a configured `modelRoles.dictation`
+	 * names only `disabledModels` models: an explicit role is refused, never replaced.
+	 */
+	#resolveModel(options: SttCallbacks): Model<Api> | undefined | null {
 		if (!this.#registry) return undefined;
 		const pool = roleCandidatePool("dictation", this.#settings, this.#registry);
+		const denied = configuredRoleDenial("dictation", this.#settings, pool);
+		if (denied) {
+			options.showWarning(formatDisabledModelError(denied.label, denied.rule));
+			return null;
+		}
 		return resolveRoleChain("dictation", this.#settings, pool)[0]?.model;
 	}
 
-	#resolveModelKey(model = this.#resolveModel()): SttModelKey {
-		return resolveSttModelSpec(model?.id).key;
+	/** The local model key to run, or null (after warning) when it is denied by `disabledModels`. */
+	#resolveModelKey(model: Model<Api> | undefined, options: SttCallbacks): SttModelKey | null {
+		const key = resolveSttModelSpec(model?.id).key;
+		const rule = disabledModelRule({ provider: "local", id: key }, this.#settings);
+		if (rule) {
+			options.showWarning(formatDisabledModelError(`local/${key}`, rule));
+			return null;
+		}
+		return key;
 	}
 
 	async #ensureDeps(options: SttCallbacks, modelKey: SttModelKey, signal: AbortSignal): Promise<SttModelKey | null> {
@@ -218,7 +235,8 @@ export class STTController {
 	}
 
 	async #startWith(editor: SttTarget, options: SttCallbacks, signal: AbortSignal): Promise<void> {
-		let model = this.#resolveModel();
+		let model = this.#resolveModel(options);
+		if (model === null) return;
 		if (model?.api === "openai-transcriptions") {
 			this.#startBuffered(editor, options, model);
 			return;
@@ -228,9 +246,12 @@ export class STTController {
 			return;
 		}
 
-		let modelKey = await this.#ensureDeps(options, this.#resolveModelKey(model), signal);
+		const initialModelKey = this.#resolveModelKey(model, options);
+		if (!initialModelKey) return;
+		let modelKey = await this.#ensureDeps(options, initialModelKey, signal);
 		if (!modelKey || signal.aborted) return;
-		model = this.#resolveModel();
+		model = this.#resolveModel(options);
+		if (model === null) return;
 		if (model?.api === "openai-transcriptions") {
 			this.#startBuffered(editor, options, model);
 			return;
@@ -239,7 +260,8 @@ export class STTController {
 			options.showWarning(`Unsupported speech-to-text API: ${model.api}`);
 			return;
 		}
-		const startModelKey = this.#resolveModelKey(model);
+		const startModelKey = this.#resolveModelKey(model, options);
+		if (!startModelKey) return;
 		if (startModelKey !== modelKey) {
 			modelKey = await this.#ensureDeps(options, startModelKey, signal);
 			if (!modelKey || signal.aborted) return;
@@ -319,6 +341,14 @@ export class STTController {
 			});
 		}
 		this.#streamRecorder = null;
+
+		const deniedBy = disabledModelRule(model, this.#settings);
+		if (deniedBy !== undefined) {
+			options.showWarning(formatDisabledModelError(model, deniedBy));
+			this.#cleanupCloud();
+			this.#setState("idle", options);
+			return;
+		}
 
 		let failed = false;
 		let finalText = "";

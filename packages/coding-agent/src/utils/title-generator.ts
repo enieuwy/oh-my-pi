@@ -24,7 +24,9 @@ import type { ModelRegistry } from "../config/model-registry";
 
 import { roleCandidatePool } from "../config/model-roles";
 import { formatModelStringWithRouting } from "../config/model-resolver";
+import { configuredRoleDenial } from "../config/model-resolver";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
 import type { Settings } from "../config/settings";
 import titleMarkerInstruction from "../prompts/system/title-marker-instruction.md" with { type: "text" };
 import titleSystemPrompt from "../prompts/system/title-system.md" with { type: "text" };
@@ -121,9 +123,11 @@ function getTitleModels(registry: ModelRegistry, settings: Settings, currentMode
 	const availableModels = roleCandidatePool("tiny", settings, registry);
 	if (availableModels.length === 0) return [];
 
-	const models = collectOnlineTinyCandidates(["tiny", "commit", "smol"], settings, availableModels).map(
-		candidate => candidate.model,
-	);
+	const roles = ["tiny", "commit", "smol"];
+	const models = collectOnlineTinyCandidates(roles, settings, availableModels).map(candidate => candidate.model);
+	// The role walk stopped on a configured role that names only denied models: no
+	// substitute, not even the current model.
+	if (models.length === 0 && roles.some(role => configuredRoleDenial(role, settings, availableModels))) return [];
 	if (
 		currentModel &&
 		(models.length === 0 || cfgRetryModelFallback.get(settings) !== false) &&
@@ -192,6 +196,7 @@ export async function generateSessionTitle(
 			firstMessage,
 			models,
 			registry,
+			settings,
 			sessionId,
 			metadataResolver,
 			signal,
@@ -203,6 +208,11 @@ export async function generateSessionTitle(
 	// A local role selection is an explicit no-billing boundary. If the worker
 	// fails (download missing, runtime crash, abort, or no output), leave the
 	// session untitled rather than advancing into a paid fallback candidate.
+	const deniedBy = disabledModelRule(firstModel, settings);
+	if (deniedBy !== undefined) {
+		logger.warn(formatDisabledModelError(firstModel, deniedBy), { sessionId });
+		return null;
+	}
 	try {
 		let localTitle: string | null;
 		if (signal) {
@@ -257,6 +267,7 @@ export async function generateTitleOnline(
 		firstMessage,
 		models,
 		registry,
+		settings,
 		sessionId,
 		metadataResolver,
 		signal,
@@ -269,6 +280,7 @@ async function generateTitleOnlineWithModels(
 	firstMessage: string,
 	models: Model<Api>[],
 	registry: ModelRegistry,
+	settings: Settings,
 	sessionId?: string,
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined,
 	signal?: AbortSignal,
@@ -293,7 +305,11 @@ async function generateTitleOnlineWithModels(
 			model: modelName,
 		};
 		logger.debug("title-generator: start", modelContext);
-
+		const deniedBy = disabledModelRule(model, settings);
+		if (deniedBy !== undefined) {
+			logger.warn(formatDisabledModelError(model, deniedBy), { ...modelContext, reason: "disabled-model" });
+			continue;
+		}
 		if (signal?.aborted) {
 			logger.debug("title-generator: aborted before attempt", {
 				...modelContext,
@@ -337,8 +353,12 @@ async function generateTitleOnlineWithModels(
 			if (model.supportsAssistantPrefill) messages.push(titlePrefill(model));
 
 			const response = await retryTransientCompletion(
-				() =>
-					completeSimple(
+				() => {
+					// Live session rules: a deny added during a credential lookup or a retry
+					// wait refuses the next request (not retryable; names the rule).
+					const deniedNow = disabledModelRule(model, settings);
+					if (deniedNow !== undefined) throw new Error(formatDisabledModelError(model, deniedNow));
+					return completeSimple(
 						model,
 						{
 							systemPrompt,
@@ -357,7 +377,8 @@ async function generateTitleOnlineWithModels(
 							metadata,
 							signal,
 						},
-					),
+					);
+				},
 				{ signal, provider: model.provider },
 			);
 

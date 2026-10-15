@@ -37,6 +37,14 @@ import { type GeneratedProvider, getBundledModels, getEffectiveTokenCost } from 
 import { type ModelKind, modelKind } from "@oh-my-pi/pi-catalog/types";
 import { getConfigRootDir, logger, VERSION } from "@oh-my-pi/pi-utils";
 import chalk from "@oh-my-pi/pi-utils/chalk";
+import {
+	deniedWireIdentity,
+	disabledModelMatcher,
+	disabledModelRule,
+	formatDisabledModelError,
+	type WireRoutingOptions,
+	withoutDisabledModels,
+} from "../config/disabled-models";
 import { ModelRegistry } from "../config/model-registry";
 import { cfgDisabledProviders } from "../config/model-settings";
 import { resolveProviderModelReference } from "../config/model-resolver";
@@ -226,6 +234,56 @@ export function resolveGatewayModel(
 }
 
 /**
+ * Resolve a client-requested model id to a model the gateway may serve. Resolution runs against
+ * the full routable index, so a denied model is never silently replaced by another model that
+ * shares its bare id; a model denied by `disabledModels` resolves to nothing.
+ */
+export function resolveServableGatewayModel(
+	id: string,
+	modelById: ReadonlyMap<string, Model<Api>>,
+	routable: readonly Model<Api>[],
+	settings: Settings,
+): Model<Api> | undefined {
+	const model = resolveGatewayModel(id, modelById, routable);
+	return model && disabledModelRule(model, settings) === undefined ? model : undefined;
+}
+
+/**
+ * The refusal message for a client-requested model that exists but `disabledModels` denies, or
+ * `undefined` for an unknown or servable model. Names the matching rule.
+ */
+export function gatewayModelRefusal(
+	id: string,
+	modelById: ReadonlyMap<string, Model<Api>>,
+	routable: readonly Model<Api>[],
+	settings: Settings,
+): string | undefined {
+	const model = resolveGatewayModel(id, modelById, routable);
+	if (!model) return undefined;
+	const rule = disabledModelRule(model, settings);
+	return rule === undefined ? undefined : formatDisabledModelError(model, rule);
+}
+
+/**
+ * The refusal message for a resolved model whose provider-resolved identity under the client's
+ * routing options (OpenRouter variant, effort routing) `disabledModels` denies, or `undefined`
+ * to serve it.
+ */
+export function gatewayRequestRefusal(
+	model: Model<Api>,
+	options: WireRoutingOptions,
+	settings: Settings,
+): string | undefined {
+	const denied = deniedWireIdentity(model, options, disabledModelMatcher(settings));
+	return denied === undefined ? undefined : formatDisabledModelError(denied.label, denied.rule);
+}
+
+/** Models `/v1/models` may advertise: the routable catalog minus models denied by `disabledModels`. */
+export function gatewayListedModels(routable: readonly Model<Api>[], settings: Settings): Model<Api>[] {
+	return routable.filter(model => disabledModelRule(model, settings) === undefined);
+}
+
+/**
  * Serialize catalog rebuilds so `registry.refresh()` passes never overlap,
  * while guaranteeing a forced rebuild requested mid-flight runs a forced pass
  * afterward. Without the follow-up pass a credential change arriving during a
@@ -303,7 +361,9 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 	// shadow broker credentials. Format handlers ask `resolveModel` to translate
 	// a client-requested `model` field into a pi-ai `Model<Api>` before dispatch;
 	// `listModels` powers `/v1/models`. `settings` carries `disabledProviders`, so
-	// discovery skips disabled providers too.
+	// discovery skips disabled providers too. `disabledModels` is applied per request
+	// instead: the full routable index keeps resolving so a denied model is refused
+	// by name, never answered by another model sharing its bare id.
 	const registry = new ModelRegistry(storage, undefined, { ignoreLocalModelConfig: true, settings });
 	let modelById = new Map<string, Model<Api>>();
 	// Routable models as one stable array per rebuild: `resolveProviderModelReference` caches its
@@ -330,8 +390,10 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		bearerTokens: gatewayToken ? [gatewayToken] : [],
 		trustProxyHeaders: flags.trustProxyHeaders,
 		version: VERSION,
-		resolveModel: (id: string) => resolveGatewayModel(id, modelById, routable),
-		listModels: () => modelById.values(),
+		resolveModel: (id: string) => resolveServableGatewayModel(id, modelById, routable, settings),
+		modelRefusal: (id: string) => gatewayModelRefusal(id, modelById, routable, settings),
+		requestRefusal: (model, options) => gatewayRequestRefusal(model, options, settings),
+		listModels: () => gatewayListedModels(routable, settings),
 		excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 	});
 	process.stdout.write(`auth-gateway listening on ${handle.url}\n`);
@@ -673,11 +735,16 @@ async function probeOneModel(
  * Stops as soon as one model returns a successful response (the credential
  * authenticated against at least one model in the catalog).
  */
-function createStrictCompletionProbe(): CompletionProbe {
+export function createStrictCompletionProbe(settings: Settings): CompletionProbe {
 	return async (input: CompletionProbeInput): Promise<CredentialCompletionResult> => {
-		const candidates = pickProbeCandidates(input.provider).slice(0, STRICT_PROBE_MAX_CANDIDATES);
-		if (candidates.length === 0) {
+		const bundled = pickProbeCandidates(input.provider);
+		if (bundled.length === 0) {
 			return { ok: null, reason: `no bearer-compatible probe model bundled for provider ${input.provider}` };
+		}
+		// Denied models are dropped before the candidate limit so allowed ones still fill it.
+		const candidates = withoutDisabledModels(bundled, settings).slice(0, STRICT_PROBE_MAX_CANDIDATES);
+		if (candidates.length === 0) {
+			return { ok: null, reason: `every probe model for provider ${input.provider} is disabled by disabledModels` };
 		}
 		const apiKey = composeProbeApiKey(input.provider, input.credential);
 		const oauthIdentity =
@@ -762,7 +829,10 @@ async function runCheck(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
 		const results = await storage.health.check({
 			excludeProviders: new Set(cfgDisabledProviders.get(settings)),
 			...(flags.strict
-				? { completionProbe: createStrictCompletionProbe(), completionTimeoutMs: STRICT_PROBE_OVERALL_TIMEOUT_MS }
+				? {
+						completionProbe: createStrictCompletionProbe(settings),
+						completionTimeoutMs: STRICT_PROBE_OVERALL_TIMEOUT_MS,
+					}
 				: {}),
 		});
 

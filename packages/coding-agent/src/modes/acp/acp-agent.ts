@@ -46,6 +46,7 @@ import {
 } from "@oh-my-pi/pi-utils/acp";
 import { disableProvider, enableProvider } from "../../capability";
 import { Settings } from "../../config/settings";
+import { disabledModelRule, disabledSelectorRule, formatDisabledModelError } from "../../config/disabled-models";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionUIContext,
@@ -53,7 +54,7 @@ import {
 	getExtensionUISelectOptionLabel,
 	timedOutAskDialogResult,
 } from "../../extensibility/extensions";
-import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
+import { runExtensionCompact, runExtensionSetModel } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
 import { MCPManager } from "../../mcp/manager";
@@ -257,10 +258,16 @@ type AcpSpeechTtsModelOption = AcpSpeechOption & {
 	voices: AcpSpeechVoiceOption[];
 };
 
-function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
+function buildAcpSpeechModelsCatalog(settings: Settings): Record<string, unknown> {
 	const localSelector = (modelId: string) => `local/${modelId}`;
-	const defaultSpeechModel = localSelector(TTS_LOCAL_MODELS[0].key);
-	const defaultDictationModel = localSelector(DEFAULT_STT_MODEL_KEY);
+	const isAllowed = (modelId: string) => !disabledModelRule({ provider: "local", id: modelId }, settings);
+	const sttModels = STT_MODELS.filter(({ key }) => isAllowed(key));
+	const ttsModels = TTS_LOCAL_MODELS.filter(({ key }) => isAllowed(key));
+	// A denied built-in default is never advertised; fall back to the first allowed model, if any.
+	const defaultSpeechKey = isAllowed(TTS_LOCAL_MODELS[0].key) ? TTS_LOCAL_MODELS[0].key : ttsModels[0]?.key;
+	const defaultDictationKey = isAllowed(DEFAULT_STT_MODEL_KEY) ? DEFAULT_STT_MODEL_KEY : sttModels[0]?.key;
+	const defaultSpeechModel = defaultSpeechKey === undefined ? null : localSelector(defaultSpeechKey);
+	const defaultDictationModel = defaultDictationKey === undefined ? null : localSelector(defaultDictationKey);
 	const voices = TTS_LOCAL_VOICE_OPTIONS.map(({ value, label }) => ({ value, label }));
 	// Speed settings are numeric, so presets are advertised as numbers clients can write back as-is.
 	const speeds = TTS_SPEED_OPTIONS.map(({ value, label }) => ({ value: Number(value), label }));
@@ -282,7 +289,7 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
 		speechToText: {
 			setting: "modelRoles.dictation",
 			defaultValue: defaultDictationModel,
-			models: STT_MODELS.map(({ key, label, description }) => ({
+			models: sttModels.map(({ key, label, description }) => ({
 				value: localSelector(key),
 				label,
 				description,
@@ -298,7 +305,7 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
 			defaultVoice: DEFAULT_TTS_VOICE,
 			defaultSpeed: DEFAULT_TTS_SPEED,
 			speedRange: { min: TTS_SPEED_MIN, max: TTS_SPEED_MAX },
-			models: TTS_LOCAL_MODELS.map(({ key, label, description, voices: modelVoices }): AcpSpeechTtsModelOption => ({
+			models: ttsModels.map(({ key, label, description, voices: modelVoices }): AcpSpeechTtsModelOption => ({
 				value: localSelector(key),
 				label,
 				description,
@@ -1139,8 +1146,14 @@ export class AcpAgent implements Agent {
 
 	async extMethod(method: string, params: { [key: string]: unknown }): Promise<{ [key: string]: unknown }> {
 		switch (method) {
-			case SPEECH_MODELS_LIST_METHOD:
-				return buildAcpSpeechModelsCatalog();
+			case SPEECH_MODELS_LIST_METHOD: {
+				const sessionRecord =
+					typeof params.sessionId === "string" ? this.#sessions.get(params.sessionId) : undefined;
+				const speechSettings =
+					sessionRecord?.session.settings ??
+					(await Settings.init({ cwd: typeof params.cwd === "string" ? params.cwd : undefined }));
+				return buildAcpSpeechModelsCatalog(speechSettings);
+			}
 			case "_omp/sessions/listAll": {
 				const limit = typeof params.limit === "number" ? Math.max(1, Math.min(5000, params.limit as number)) : 1000;
 				const sessions = await SessionManager.listAll();
@@ -1829,6 +1842,8 @@ export class AcpAgent implements Agent {
 	async #setModelById(session: AgentSession, modelId: string): Promise<void> {
 		const model = session.getAvailableModels().find(candidate => this.#toModelId(candidate) === modelId);
 		if (!model) {
+			const denied = disabledSelectorRule(modelId, session.settings);
+			if (denied) throw new Error(formatDisabledModelError(denied.label, denied.rule));
 			throw new Error(`Unknown ACP model: ${modelId}`);
 		}
 		await session.setModel(model);
@@ -2601,14 +2616,7 @@ export class AcpAgent implements Agent {
 				getAllTools: () => record.session.getAllToolInfos(),
 				setActiveTools: toolNames => record.session.setActiveToolsByName(toolNames),
 				getCommands: () => getSessionSlashCommands(record.session),
-				setModel: async model => {
-					const apiKey = await record.session.modelRegistry.getApiKey(model);
-					if (!apiKey) {
-						return false;
-					}
-					await record.session.setModel(model);
-					return true;
-				},
+				setModel: model => runExtensionSetModel(record.session, model),
 				getThinkingLevel: () => record.session.thinkingLevel,
 				setThinkingLevel: level => record.session.setThinkingLevel(level),
 				getServiceTiers: () => record.session.serviceTierByFamily,

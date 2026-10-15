@@ -1,5 +1,12 @@
 import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { formatModelStringWithRouting, resolveModelOverride, resolveRoleSelection } from "../config/model-resolver";
+import { logger } from "@oh-my-pi/pi-utils";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
+import {
+	configuredRoleDenial,
+	formatModelStringWithRouting,
+	resolveModelOverride,
+	resolveRoleSelection,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import {
 	expandDefaultRetryFallbackChains,
@@ -62,6 +69,11 @@ function expandFallbackCandidates(
 	out: OnlineTinyCandidate[],
 ): void {
 	const add = (role: string, model: Model<Api>): boolean => {
+		const rule = disabledModelRule(model, settings);
+		if (rule !== undefined) {
+			logger.warn(formatDisabledModelError(model, rule));
+			return false;
+		}
 		const key = candidateKey(model);
 		if (seen.has(key)) return false;
 		seen.add(key);
@@ -90,7 +102,10 @@ function expandFallbackCandidates(
 			// Resolve raw selectors (including `@upstream` / fuzzy) the same way
 			// turn-recovery does, instead of exact (provider, id) lookup only.
 			const resolved = resolveModelOverride([candidate.raw], registryShim, settings);
-			const fallback = resolved.model ?? context.modelLookup.find(candidate.provider, candidate.id);
+			// A refused resolution is not restored through the exact lookup.
+			const fallback = resolved.disabledModel
+				? undefined
+				: (resolved.model ?? context.modelLookup.find(candidate.provider, candidate.id));
 			if (!fallback) continue;
 			if (!add(role, fallback)) continue;
 			// After landing on this fallback, consult its own chain key so configs
@@ -134,7 +149,19 @@ export function collectOnlineTinyCandidates(
 	const primaries: OnlineTinyCandidate[] = [];
 	for (const role of roles) {
 		const resolved = resolveRoleSelection([role], settings, availableModels);
-		if (!resolved?.model) continue;
+		if (!resolved?.model) {
+			// A configured role that names only denied models ends the walk: a later role
+			// would silently replace an explicit choice.
+			const denied = configuredRoleDenial(role, settings, availableModels);
+			if (denied) {
+				logger.warn("Tiny role refused", {
+					role,
+					reason: formatDisabledModelError(denied.label, denied.rule),
+				});
+				return out;
+			}
+			continue;
+		}
 		addPrimary(resolved.role, resolved.model);
 		if (!fallbackEnabled && !options?.tryAllRoles) return out;
 		if (fallbackEnabled) primaries.push({ role: resolved.role, model: resolved.model });
@@ -181,10 +208,17 @@ export function expandOnlineTinyModelFallbacks(
 ): Model<Api>[] {
 	const seen = new Set<string>([candidateKey(model)]);
 	const out: OnlineTinyCandidate[] = [{ role: "current", model }];
-	if (cfgRetryModelFallback.get(settings) === false) return [model];
+	// A denied seed model never appears in the result; its fallback chain still applies.
+	const deniedBy = disabledModelRule(model, settings);
+	const seedOnly = (): Model<Api>[] => {
+		if (deniedBy === undefined) return [model];
+		logger.warn(formatDisabledModelError(model, deniedBy));
+		return [];
+	};
+	if (cfgRetryModelFallback.get(settings) === false) return seedOnly();
 
 	const configuredChains = cfgRetryFallbackChains.get(settings);
-	if (!configuredChains || typeof configuredChains !== "object") return [model];
+	if (!configuredChains || typeof configuredChains !== "object") return seedOnly();
 
 	const context = createFallbackContext(configuredChains, settings, availableModels);
 	expandFallbackCandidates(
@@ -201,5 +235,8 @@ export function expandOnlineTinyModelFallbacks(
 		seen,
 		out,
 	);
-	return out.map(candidate => candidate.model);
+	const result = out.map(candidate => candidate.model);
+	if (deniedBy === undefined) return result;
+	logger.warn(formatDisabledModelError(model, deniedBy));
+	return result.filter(candidate => candidateKey(candidate) !== candidateKey(model));
 }

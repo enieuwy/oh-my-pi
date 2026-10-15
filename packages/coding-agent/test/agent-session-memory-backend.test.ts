@@ -23,7 +23,7 @@ import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-c
 import { BUILTIN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { tinyModelClient } from "@oh-my-pi/pi-coding-agent/tiny/title-client";
 import { resetMemoryForTests } from "@oh-my-pi/pi-mnemopi";
-import { getProjectAgentDir, getProjectDir, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
+import { getProjectAgentDir, getProjectDir, logger, setProjectDir, TempDir } from "@oh-my-pi/pi-utils";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 
 import { cfgAutolearnEnabled } from "@oh-my-pi/pi-coding-agent/autolearn/settings";
@@ -157,6 +157,32 @@ describe("AgentSession memory backend lifecycle", () => {
 			timestamp: Date.now(),
 		};
 	}
+
+	it("refuses a remote memory LLM that only MNEMOPI_LLM_MODEL names when disabledModels denies it", async () => {
+		settings = Settings.isolated({
+			"compaction.enabled": false,
+			"memory.backend": "mnemopi",
+			"mnemopi.noEmbeddings": true,
+			"mnemopi.llmMode": "remote",
+			"mnemopi.autoRetain": false,
+			disabledModels: ["openrouter/foo/bar"],
+		});
+		const warn = spyOn(logger, "warn");
+		const previous = Bun.env.MNEMOPI_LLM_MODEL;
+		Bun.env.MNEMOPI_LLM_MODEL = "foo/bar";
+		try {
+			const current = createSession(async () => []);
+			await current.applyMemoryBackend();
+			expect(getMnemopiSessionState(current)!.config.providerOptions.llm).toBe(false);
+		} finally {
+			if (previous === undefined) delete Bun.env.MNEMOPI_LLM_MODEL;
+			else Bun.env.MNEMOPI_LLM_MODEL = previous;
+		}
+		expect(warn.mock.calls.map(call => String(call[0])).join("\n")).toContain(
+			'Model "openrouter/foo/bar" is disabled by disabledModels rule "openrouter/foo/bar". Remove or narrow that rule to use it.',
+		);
+		warn.mockRestore();
+	});
 
 	it("journals one remote memory completion with its reported usage on the active branch", async () => {
 		const model = getBundledModel("anthropic", "claude-sonnet-4-6")!;

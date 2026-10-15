@@ -13,7 +13,13 @@ import {
 	prompt,
 } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, parseModelPattern, resolveRoleSelection } from "../config/model-resolver";
+import { formatDisabledModelError, withoutDisabledModels } from "../config/disabled-models";
+import {
+	configuredRoleDenial,
+	getModelMatchPreferences,
+	parseModelPattern,
+	resolveRoleSelection,
+} from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
 import compressDescriptionPrompt from "../prompts/skills/compress-description.md" with { type: "text" };
@@ -50,7 +56,9 @@ export function createSkillDescriptionCompressor(
 	getTelemetry?: () => AgentTelemetry | undefined,
 ): SkillDescriptionCompressor {
 	const select = (): Model<Api> | undefined => {
-		const available = registry.getAvailable();
+		const available = withoutDisabledModels(registry.getAvailable(), settings);
+		// A configured `smol` role that names only denied models is refused, not replaced by the priority chain.
+		if (configuredRoleDenial("smol", settings, available)) return undefined;
 		const configured = resolveRoleSelection(["smol"], settings, available);
 		if (configured) return configured.model;
 		const preferences = getModelMatchPreferences(settings);
@@ -67,7 +75,16 @@ export function createSkillDescriptionCompressor(
 		},
 		async compress(_name, _description, request) {
 			const model = select();
-			if (!model) throw new Error("No smol or tiny model available");
+			if (!model) {
+				const denied = configuredRoleDenial(
+					"smol",
+					settings,
+					withoutDisabledModels(registry.getAvailable(), settings),
+				);
+				throw new Error(
+					denied ? formatDisabledModelError(denied.label, denied.rule) : "No smol or tiny model available",
+				);
+			}
 			const apiKey = await registry.getApiKey(model, sessionId);
 			if (!apiKey) throw new Error(`No credential for ${model.provider}/${model.id}`);
 			const response = await instrumentedCompleteSimple(

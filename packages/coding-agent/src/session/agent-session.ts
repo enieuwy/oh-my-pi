@@ -498,6 +498,7 @@ import { cfgInterruptMode } from "../modes/settings";
 import { cfgFollowUpMode } from "../modes/settings";
 import { cfgSteeringMode } from "../modes/settings";
 import { cfgDisabledProviders, cfgModelRoles } from "../config/model-settings";
+import { disabledModelRule, formatDisabledModelError, withSessionDisabledModels } from "../config/disabled-models";
 import { cfgEvalToolsEnabled } from "../eval/settings";
 import { cfgExtensions, type SkillsSettings } from "../extensibility/settings";
 import {
@@ -1755,7 +1756,7 @@ export class AgentSession implements SettingsScope {
 		this.#todo = new TodoTracker(todoHost);
 		this.#modelMentions = new ModelMentionRegistry({
 			sessionManager: this.sessionManager,
-			modelRegistry: this.#modelRegistry,
+			modelRegistry: withSessionDisabledModels(this.#modelRegistry, this.settings),
 			scopedModels: () => this.scopedModels.map(s => s.model),
 			inheritedAgents: config.inheritedSessionAgents,
 		});
@@ -8219,6 +8220,7 @@ export class AgentSession implements SettingsScope {
 		const ctx = {
 			...baseCtx,
 			hasQueuedMessages: baseCtx.hasPendingMessages,
+			settings: this.settings,
 		} as unknown as CustomCommandContext;
 
 		try {
@@ -10110,7 +10112,7 @@ export class AgentSession implements SettingsScope {
 	 * always take effect; if the current transcript is too large for the target
 	 * model, the next prompt's compaction/error path owns that recovery instead
 	 * of leaving the session pinned to the old model.
-	 * @throws Error if no API key available for the model
+	 * @throws Error if the model is denied by `disabledModels`, or if no API key available for the model
 	 */
 	async setModel(
 		model: Model,
@@ -10121,16 +10123,24 @@ export class AgentSession implements SettingsScope {
 			persist?: boolean;
 		},
 	): Promise<{ switched: boolean }> {
+		this.#assertModelNotDisabled(model);
 		return this.#models.setModel(model, role, options);
 	}
 
+	/** Refuses an explicit switch to a model denied by `disabledModels`, naming the matching rule. */
+	#assertModelNotDisabled(model: Model): void {
+		const rule = disabledModelRule(model, this.settings);
+		if (rule !== undefined) throw new Error(formatDisabledModelError(model, rule));
+	}
+
 	/** Selects a model for this session without updating persisted model settings. */
-	setModelTemporary(
+	async setModelTemporary(
 		model: Model,
 		thinkingLevel?: ConfiguredThinkingLevel,
 		options?: { ephemeral?: boolean },
 	): Promise<void> {
-		return this.#models.setModelTemporary(model, thinkingLevel, options);
+		this.#assertModelNotDisabled(model);
+		await this.#models.setModelTemporary(model, thinkingLevel, options);
 	}
 
 	/** Cycles the scoped model set, or all available models when no scope exists. */
@@ -10144,8 +10154,9 @@ export class AgentSession implements SettingsScope {
 	}
 
 	/** Applies a resolved role model without changing global settings. */
-	applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
-		return this.#models.applyRoleModel(entry);
+	async applyRoleModel(entry: ResolvedRoleModel): Promise<void> {
+		this.#assertModelNotDisabled(entry.model);
+		await this.#models.applyRoleModel(entry);
 	}
 
 	/** Cycles the configured role models in the supplied order. */
@@ -10742,6 +10753,7 @@ export class AgentSession implements SettingsScope {
 	}
 
 	async #setModelWithProviderSessionReset(model: Model): Promise<void> {
+		this.#assertModelNotDisabled(model);
 		const currentModel = this.model;
 		const isChanging = !currentModel || !modelsAreEqual(currentModel, model);
 		if (currentModel) {

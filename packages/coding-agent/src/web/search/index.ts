@@ -11,9 +11,15 @@ import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import { modelKind } from "@oh-my-pi/pi-catalog/types";
 import { formatAge, formatCount, prompt, truncate } from "@oh-my-pi/pi-utils";
 import { ModelRegistry } from "../../config/model-registry";
-import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError } from "../../config/disabled-models";
+import {
+	configuredRoleDenial,
+	type RoleChainCandidate,
+	resolveModelRoleValue,
+	resolveRoleChain,
+} from "../../config/model-resolver";
 import { roleCandidatePool } from "../../config/model-roles";
-import { settings } from "../../config/settings";
+import { type Settings, settings as globalSettings } from "../../config/settings";
 import type { CustomTool, CustomToolContext } from "../../extensibility/custom-tools/types";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
@@ -125,6 +131,8 @@ interface ExecuteSearchOptions {
 	sessionId?: string;
 	/** The session's active model; `web/hosted` searches through it. */
 	sessionModel?: Model<Api>;
+	/** The requesting session's settings; the process-wide settings when omitted. */
+	settings?: Settings;
 	signal?: AbortSignal;
 }
 
@@ -158,7 +166,11 @@ function expandHostedCandidate(
  * or prepend {@link xaiModelChain} when the chain has none. Unchanged without
  * xAI credentials.
  */
-function preferXAI(chain: RoleChainCandidate[], modelRegistry: ModelRegistry): RoleChainCandidate[] {
+function preferXAI(
+	chain: RoleChainCandidate[],
+	modelRegistry: ModelRegistry,
+	settings: Settings,
+): RoleChainCandidate[] {
 	const xai = chain.filter(candidate => candidate.model.webSearch === "xai");
 	if (xai.length > 0) return [...xai, ...chain.filter(candidate => candidate.model.webSearch !== "xai")];
 	return [...xaiModelChain(modelRegistry, settings).map(model => ({ model, explicit: false })), ...chain];
@@ -171,24 +183,56 @@ async function executeSearch(
 	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
 	const { authStorage, sessionId, signal } = options;
+	const settings = options.settings ?? globalSettings;
 	const modelRegistry = options.modelRegistry ?? new ModelRegistry(authStorage, undefined, { settings });
 	const pool = roleCandidatePool("web", settings, modelRegistry);
-	const candidates = params.model
-		? (() => {
-				const resolved = resolveModelRoleValue(params.model, pool, { settings });
-				return resolved.model
-					? [{ model: resolved.model, explicit: true, thinkingLevel: resolved.thinkingLevel }]
-					: [];
-			})()
+	// A selector (or configured `web` role) that names only denied models is refused, not replaced by another model.
+	const explicitResolution = params.model ? resolveModelRoleValue(params.model, pool, { settings }) : undefined;
+	const denied = explicitResolution
+		? explicitResolution.model
+			? undefined
+			: explicitResolution.disabledModel
+		: configuredRoleDenial("web", settings, pool);
+	if (denied) {
+		const message = formatDisabledModelError(denied.label, denied.rule);
+		return {
+			content: [{ type: "text" as const, text: `Error: ${message}` }],
+			details: { response: { provider: "none", sources: [] }, error: message },
+		};
+	}
+	const candidates = explicitResolution
+		? explicitResolution.model
+			? [{ model: explicitResolution.model, explicit: true, thinkingLevel: explicitResolution.thinkingLevel }]
+			: []
 		: resolveRoleChain("web", settings, pool);
 	const parsedQuery = parseSearchQuery(params.query);
-	let expanded = rankXAIProviders(
+	const hostedExpanded = rankXAIProviders(
 		candidates.flatMap(candidate => expandHostedCandidate(candidate, options.sessionModel, pool)),
 		candidate => candidate.model,
 		settings,
 	);
+	// `web/hosted` expands to the session's own model, which is not in the role pool: check each concrete model.
+	let deniedExpanded: { model: Model<Api>; rule: string } | undefined;
+	let expanded = hostedExpanded.filter(candidate => {
+		const rule = disabledModelRule(candidate.model, settings);
+		if (rule === undefined) return true;
+		deniedExpanded ??= { model: candidate.model, rule };
+		return false;
+	});
+	if (deniedExpanded && (params.model || expanded.length === 0)) {
+		const message = formatDisabledModelError(deniedExpanded.model, deniedExpanded.rule);
+		return {
+			content: [{ type: "text" as const, text: `Error: ${message}` }],
+			details: { response: { provider: "none", sources: [] }, error: message },
+		};
+	}
 	// Only xAI reaches X posts; X-only queries try it first even when the role prefers another engine.
-	if (!params.model && targetsX(parsedQuery)) expanded = preferXAI(expanded, modelRegistry);
+	if (!params.model && targetsX(parsedQuery)) {
+		// preferXAI may add xAI models the session denies.
+		expanded = preferXAI(expanded, modelRegistry, settings).filter(
+			candidate => disabledModelRule(candidate.model, settings) === undefined,
+		);
+	}
 
 	// Invariant across candidates; resolve once before walking the role chain.
 	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
@@ -351,6 +395,7 @@ export async function runSearchQuery(
 		modelRegistry?: ModelRegistry;
 		sessionId?: string;
 		sessionModel?: Model<Api>;
+		settings?: Settings;
 		signal?: AbortSignal;
 	} = {},
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchResultDetails }> {
@@ -365,6 +410,7 @@ export async function runSearchQuery(
 			modelRegistry: options.modelRegistry,
 			sessionId: options.sessionId,
 			sessionModel: options.sessionModel,
+			settings: options.settings,
 			signal: options.signal,
 		});
 	} finally {
@@ -424,6 +470,7 @@ export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRe
 			modelRegistry: this.#session.modelRegistry,
 			sessionId,
 			sessionModel: this.#session.getActiveModel?.(),
+			settings: this.#session.settings,
 			signal,
 		});
 	}
@@ -451,6 +498,7 @@ export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchResul
 			modelRegistry: ctx.modelRegistry,
 			sessionId,
 			sessionModel: ctx.model,
+			settings: ctx.settings,
 			signal,
 		});
 	},

@@ -16,6 +16,7 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveModelOverride,
 } from "../config/model-resolver";
+import { formatDisabledModelError, withSessionDisabledModels } from "../config/disabled-models";
 import type { Settings } from "../config/settings";
 import agentCreationArchitectPrompt from "../prompts/system/agent-creation-architect.md" with { type: "text" };
 import agentCreationUserPrompt from "../prompts/system/agent-creation-user.md" with { type: "text" };
@@ -82,7 +83,7 @@ export function createAgentsHubDeps(
 				};
 			});
 		},
-		getAvailableModels: () => modelRegistry.getAvailable(),
+		getAvailableModels: () => withSessionDisabledModels(modelRegistry, settings).getAvailable(),
 		effectiveModelPatterns: agent =>
 			resolveAgentModelPatterns({
 				settingsOverride: agent.overrideModel,
@@ -145,7 +146,10 @@ export function createAgentsHubDeps(
 				activeModelPattern ?? defaultModelPattern ?? settings.getModelRole("default"),
 				settings,
 			);
-			const { model } = resolveModelOverride(patterns, modelRegistry, settings);
+			const { model, disabledModel } = resolveModelOverride(patterns, modelRegistry, settings);
+			// A configured model that is denied by `disabledModels` is refused, not replaced by another model.
+			if (!model && disabledModel)
+				throw new Error(formatDisabledModelError(disabledModel.label, disabledModel.rule));
 			const selectedModel = model ?? modelRegistry.getAvailable()[0];
 			if (!selectedModel) throw new Error("No available model to generate agent specification.");
 			const { session } = await createAgentSession({

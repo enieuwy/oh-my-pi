@@ -1,17 +1,18 @@
 import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
 import type { ApiKeyResolverRegistry } from "../config/api-key-resolver";
+import { formatDisabledModelError } from "../config/disabled-models";
 import {
 	getModelMatchPreferences,
 	type ModelLookupRegistry,
 	parseModelPattern,
+	type ResolvedModelRoleValue,
 	resolveModelRoleValue,
-	resolveRoleSelection,
 } from "../config/model-resolver";
 import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
-import { concreteThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
+import { type ConfiguredThinkingLevel, concreteThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 
 export interface ResolvedCommitModel {
 	model: Model<Api>;
@@ -34,6 +35,34 @@ type CommitModelRegistry = ModelLookupRegistry &
 		getApiKey: (model: Model<Api>) => Promise<string | undefined>;
 	};
 
+/** An explicit selection that resolves only to a `disabledModels` model fails with the rule; no other model is substituted. */
+function refuseDeniedRoleValue(resolved: ResolvedModelRoleValue): ResolvedModelRoleValue {
+	if (resolved.model === undefined && resolved.disabledModel) {
+		throw new Error(formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule));
+	}
+	return resolved;
+}
+
+/**
+ * First configured role that resolves to an available model. A configured role
+ * that resolves only to denied models stops the walk with the `disabledModels`
+ * diagnostic instead of falling through to the next role.
+ */
+function resolveCommitRoleSelection(
+	roles: readonly string[],
+	settings: Settings,
+	available: Model<Api>[],
+): { model: Model<Api>; thinkingLevel?: ConfiguredThinkingLevel } | undefined {
+	const matchPreferences = getModelMatchPreferences(settings);
+	for (const role of roles) {
+		const resolved = refuseDeniedRoleValue(
+			resolveModelRoleValue(settings.getModelRole(role), available, { settings, matchPreferences }),
+		);
+		if (resolved.model) return { model: resolved.model, thinkingLevel: resolved.thinkingLevel };
+	}
+	return undefined;
+}
+
 export async function resolvePrimaryModel(
 	override: string | undefined,
 	settings: Settings,
@@ -42,8 +71,8 @@ export async function resolvePrimaryModel(
 	const available = modelRegistry.getAvailable();
 	const matchPreferences = getModelMatchPreferences(settings);
 	const resolved = override
-		? resolveModelRoleValue(override, available, { settings, matchPreferences })
-		: resolveRoleSelection(["commit", "smol", ...CHAT_MODEL_ROLE_IDS], settings, available);
+		? refuseDeniedRoleValue(resolveModelRoleValue(override, available, { settings, matchPreferences }))
+		: resolveCommitRoleSelection(["commit", "smol", ...CHAT_MODEL_ROLE_IDS], settings, available);
 	const model = resolved?.model;
 	if (!model) {
 		throw new Error("No model available for commit generation");
@@ -66,7 +95,7 @@ export async function resolveSmolModel(
 	fallbackApiKey: ApiKey,
 ): Promise<ResolvedCommitModel> {
 	const available = modelRegistry.getAvailable();
-	const resolvedSmol = resolveRoleSelection(["smol"], settings, available);
+	const resolvedSmol = resolveCommitRoleSelection(["smol"], settings, available);
 	if (resolvedSmol?.model) {
 		const apiKey = await modelRegistry.getApiKey(resolvedSmol.model);
 		if (apiKey) {

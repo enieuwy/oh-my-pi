@@ -4,7 +4,8 @@ import { completeSimple, Effort, type Model, retryTransientCompletion } from "@o
 import { clampThinkingLevelForModel } from "@oh-my-pi/pi-catalog/model-thinking";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { getModelMatchPreferences, resolveModelRoleValue, resolveRoleSelection } from "../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
+import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import extractInputTemplate from "../prompts/memories/sharpshooter-extract-input.md" with { type: "text" };
 import extractSystemTemplate from "../prompts/memories/sharpshooter-extract-system.md" with { type: "text" };
@@ -155,19 +156,39 @@ export async function resolveSharpshooterModel(
 	settings: Settings,
 	modelRegistry: ModelRegistry,
 ): Promise<Model | undefined> {
+	const matchPreferences = getModelMatchPreferences(settings);
 	const selector = cfgSharpshooterModel.get(settings);
 	if (selector) {
-		const resolved = resolveModelRoleValue(selector, modelRegistry.getAll(), {
-			settings,
-			matchPreferences: getModelMatchPreferences(settings),
-		});
+		// The catalog is unfiltered; denied models never serve as the extraction model.
+		const catalog = modelRegistry.getAll().filter(model => disabledModelRule(model, settings) === undefined);
+		const resolved = resolveModelRoleValue(selector, catalog, { settings, matchPreferences });
 		if (resolved.model) return resolved.model;
+		// A configured selector that names only denied models is refused, not replaced by the `smol` role.
+		if (resolved.disabledModel) {
+			logger.warn("Sharpshooter extraction skipped", {
+				selector,
+				reason: formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule),
+			});
+			return undefined;
+		}
 		logger.debug("Sharpshooter extraction model selector did not resolve", { selector });
 	}
 
-	const fallback = resolveRoleSelection(["smol"], settings, modelRegistry.getAvailable())?.model;
-	if (!fallback) logger.debug("Sharpshooter extraction skipped: no model available");
-	return fallback;
+	const smol = resolveModelRoleValue(settings.getModelRole("smol"), modelRegistry.getAvailable(), {
+		settings,
+		matchPreferences,
+	});
+	if (!smol.model) {
+		if (smol.disabledModel) {
+			logger.warn("Sharpshooter extraction skipped", {
+				role: "smol",
+				reason: formatDisabledModelError(smol.disabledModel.label, smol.disabledModel.rule),
+			});
+		} else {
+			logger.debug("Sharpshooter extraction skipped: no model available");
+		}
+	}
+	return smol.model;
 }
 
 /** Start best-effort extraction for one committed user prompt without blocking the caller. */

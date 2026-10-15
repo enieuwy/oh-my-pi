@@ -8,8 +8,9 @@ import type * as MnemopiDiagnoseNs from "@oh-my-pi/pi-mnemopi/diagnose";
 import type { DiagnosticSummary } from "@oh-my-pi/pi-mnemopi/diagnose";
 import { logger, prompt, withLoopPhase } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
 import { roleCandidatePool } from "../config/model-roles";
-import { resolveRoleChain } from "../config/model-resolver";
+import { configuredRoleDenial, resolveRoleChain } from "../config/model-resolver";
 import { type JudgmentUsageLedger, journalJudgmentUsage } from "../judgment";
 import type {
 	MemoryBackend,
@@ -519,13 +520,40 @@ async function loadMnemopiConfigWithProviders(
  */
 async function openrouterKeyResolver(
 	modelRegistry: ModelRegistry,
+	settings: MemoryBackendStartOptions["settings"],
 	sessionId: string,
 	baseUrl: string | undefined,
+	modelId: string | undefined,
 ): Promise<ApiKeyResolver | undefined> {
 	if (baseUrl !== undefined && !hostMatchesUrl(baseUrl, "openrouter")) return undefined;
-	const key = await modelRegistry.getApiKeyForProvider("openrouter", sessionId);
+	const key = await modelRegistry.getApiKeyForProvider("openrouter", sessionId, { modelId });
 	if (key === undefined || key === "") return undefined;
-	return modelRegistry.resolver("openrouter", { sessionId });
+	const inner = modelRegistry.resolver("openrouter", { sessionId, modelId });
+	if (modelId === undefined) return inner;
+	// Live settings: a rule added after startup must still refuse every later request.
+	return (...args) => {
+		const rule = disabledModelRule({ provider: "openrouter", id: modelId }, settings);
+		if (rule !== undefined) throw new Error(formatDisabledModelError(`openrouter/${modelId}`, rule));
+		return inner(...args);
+	};
+}
+
+/**
+ * Wrap a user-pinned OpenRouter key (or key resolver) so a `disabledModels` rule added after startup
+ * still refuses every later request for `modelId` (a plain string cannot hold the check).
+ */
+function guardPinnedOpenRouterKey(
+	key: string | ApiKeyResolver,
+	settings: MemoryBackendStartOptions["settings"],
+	baseUrl: string | undefined,
+	modelId: string | undefined,
+): string | ApiKeyResolver {
+	if (modelId === undefined || (baseUrl !== undefined && !hostMatchesUrl(baseUrl, "openrouter"))) return key;
+	return ctx => {
+		const rule = disabledModelRule({ provider: "openrouter", id: modelId }, settings);
+		if (rule !== undefined) throw new Error(formatDisabledModelError(`openrouter/${modelId}`, rule));
+		return typeof key === "string" ? key : key(ctx);
+	};
 }
 
 async function resolveMnemopiProviderOptions(
@@ -535,13 +563,26 @@ async function resolveMnemopiProviderOptions(
 	sessionId: string,
 	usageLedger: Partial<JudgmentUsageLedger>,
 ): Promise<MnemopiProviderOptions> {
+	const embeddingModel = config.providerOptions.embeddingModel;
+	const embeddingUrl = config.providerOptions.embeddingApiUrl;
+	const embeddingRule =
+		embeddingModel && (embeddingUrl === undefined || hostMatchesUrl(embeddingUrl, "openrouter"))
+			? disabledModelRule({ provider: "openrouter", id: embeddingModel }, settings)
+			: undefined;
+	if (embeddingRule) {
+		logger.warn(
+			`Mnemopi: embedding model refused; continuing without embeddings. ${formatDisabledModelError(`openrouter/${embeddingModel}`, embeddingRule)}`,
+		);
+	}
 	const base: MnemopiProviderOptions = {
-		noEmbeddings: config.providerOptions.noEmbeddings,
-		embeddingModel: config.providerOptions.embeddingModel,
-		embeddingApiUrl: config.providerOptions.embeddingApiUrl,
-		embeddingApiKey:
-			config.providerOptions.embeddingApiKey ??
-			(await openrouterKeyResolver(modelRegistry, sessionId, config.providerOptions.embeddingApiUrl)),
+		noEmbeddings: embeddingRule ? true : config.providerOptions.noEmbeddings,
+		embeddingModel,
+		embeddingApiUrl: embeddingUrl,
+		embeddingApiKey: embeddingRule
+			? undefined
+			: config.providerOptions.embeddingApiKey !== undefined
+				? guardPinnedOpenRouterKey(config.providerOptions.embeddingApiKey, settings, embeddingUrl, embeddingModel)
+				: await openrouterKeyResolver(modelRegistry, settings, sessionId, embeddingUrl, embeddingModel),
 		llm: false,
 	};
 
@@ -550,28 +591,55 @@ async function resolveMnemopiProviderOptions(
 	// An explicitly configured external Mnemopi endpoint remains authoritative;
 	// role selection only supplies the normal managed-model path.
 	if (config.llmMode === "remote") {
+		// Only OpenRouter maps to a registry provider here; any other base URL is an
+		// external endpoint, not a registry model, so disabledModels does not apply.
+		// An unset base URL falls back to OpenRouter inside the extraction client.
+		// Mirror the Mnemopi package's own env fallbacks so an unset option cannot bypass the deny check.
+		const llmModel = config.llmModel || Bun.env.MNEMOPI_LLM_MODEL || undefined;
+		const llmBaseUrl = config.llmBaseUrl || Bun.env.MNEMOPI_LLM_BASE_URL || undefined;
+		const llmRule =
+			llmModel && (llmBaseUrl === undefined || hostMatchesUrl(llmBaseUrl, "openrouter"))
+				? disabledModelRule({ provider: "openrouter", id: llmModel }, settings)
+				: undefined;
+		if (llmRule) {
+			logger.warn(
+				`Mnemopi: llmMode=remote model refused; continuing without LLM. ${formatDisabledModelError(`openrouter/${llmModel}`, llmRule)}`,
+			);
+			return base;
+		}
 		return {
 			...base,
 			llm: {
-				baseUrl: config.llmBaseUrl,
+				baseUrl: llmBaseUrl,
 				apiKey:
-					config.llmApiKey ??
-					(config.llmBaseUrl === undefined
-						? undefined
-						: await openrouterKeyResolver(modelRegistry, sessionId, config.llmBaseUrl)),
-				model: config.llmModel,
+					config.llmApiKey !== undefined
+						? guardPinnedOpenRouterKey(config.llmApiKey, settings, llmBaseUrl, llmModel)
+						: llmBaseUrl === undefined
+							? undefined
+							: await openrouterKeyResolver(modelRegistry, settings, sessionId, llmBaseUrl, llmModel),
+				model: llmModel,
 			},
 		};
 	}
 
 	try {
-		const candidates = resolveRoleChain("memory", settings, roleCandidatePool("memory", settings, modelRegistry));
+		const pool = roleCandidatePool("memory", settings, modelRegistry);
+		// A configured `memory` role that names only denied models is refused, not replaced by its fallbacks.
+		const denied = configuredRoleDenial("memory", settings, pool);
+		if (denied) {
+			logger.warn(
+				`Mnemopi: llmMode=smol memory model refused; continuing without LLM. ${formatDisabledModelError(denied.label, denied.rule)}`,
+			);
+			return base;
+		}
+		const candidates = resolveRoleChain("memory", settings, pool);
 		const primary = candidates[0]?.model;
 		if (!primary) {
 			logger.warn("Mnemopi: llmMode=smol but no memory model resolved; continuing without LLM.");
 			return base;
 		}
 
+		const warnedDenied = new Set<string>();
 		const complete = async (prompt: string, opts?: MnemopiLlmCompleteOptions): Promise<string | null> => {
 			// journalJudgmentUsage snapshots the session id. /new, fork, and session
 			// switch keep this function, so bind inside each call. An in-flight call
@@ -587,6 +655,18 @@ async function resolveMnemopiProviderOptions(
 
 			for (const { model } of candidates) {
 				if (signal?.aborted) return null;
+				// Live settings: a rule added after startup must still stop this candidate.
+				const candidateRule = disabledModelRule(model, settings);
+				if (candidateRule) {
+					const key = `${model.provider}/${model.id}`;
+					if (!warnedDenied.has(key)) {
+						warnedDenied.add(key);
+						logger.warn(
+							`Mnemopi: memory completion candidate skipped. ${formatDisabledModelError(key, candidateRule)}`,
+						);
+					}
+					continue;
+				}
 				try {
 					if (model.api === "local-inference") {
 						const result = await tinyModelClient.complete(model.id, request.prompt, {

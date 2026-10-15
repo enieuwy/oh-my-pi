@@ -12,6 +12,7 @@ import {
 import { isEnoent, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
 import { formatDoubleTap } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
+import { withSessionDisabledModels } from "../../config/disabled-models";
 import { formatModelRoleAlias, roleCandidatePool } from "../../config/model-roles";
 import { resolveModelRoleValue } from "../../config/model-resolver";
 import { isSettingsInitialized, settings } from "../../config/settings";
@@ -2607,7 +2608,9 @@ export class InputController {
 			commandUsage: name => commandUsage.get(name),
 			modelMentions: createModelMentionSource({
 				source: createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
-				registry: this.ctx.session.modelRegistry,
+				registry: this.ctx.session.modelRegistry
+					? withSessionDisabledModels(this.ctx.session.modelRegistry, this.ctx.settings)
+					: this.ctx.session.modelRegistry,
 				scopedModels: () => this.ctx.session.scopedModels.map(s => s.model),
 			}),
 			// This TUI host uses the default registry; the receiving session can change with focus.

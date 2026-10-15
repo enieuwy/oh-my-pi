@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import { runSearchQuery } from "@oh-my-pi/pi-coding-agent/web/search";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { runSearchQuery, WebSearchTool } from "@oh-my-pi/pi-coding-agent/web/search";
 import * as provider from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import { SearchProvider } from "@oh-my-pi/pi-coding-agent/web/search/provider";
 import type { SearchParams } from "@oh-my-pi/pi-coding-agent/web/search/providers/base";
@@ -123,5 +124,34 @@ describe("default web chain", () => {
 
 		expect(attempted).toEqual([]);
 		expect(result.details.error).toContain("no web search grounding");
+	});
+
+	it("applies the requesting session's disabledModels through the tool entry point, not the global settings", async () => {
+		const session = {
+			settings: Settings.isolated({
+				modelRoles: { web: "anthropic/claude-sonnet-4-5" },
+				disabledModels: ["anthropic/*"],
+			}),
+			modelRegistry,
+			authStorage,
+			getSessionId: () => "session-1",
+			getActiveModel: () => undefined,
+		} as unknown as ToolSession;
+
+		const result = await new WebSearchTool(session).execute("call-1", { query: "anything" });
+
+		expect(attempted).toEqual([]);
+		expect(result.details?.error).toBe(
+			'Model "anthropic/claude-sonnet-4-5" is disabled by disabledModels rule "anthropic/*". Remove or narrow that rule to use it.',
+		);
+	});
+
+	it("never lets an X-only query add an xAI model the session denies", async () => {
+		const settings = Settings.isolated({ disabledModels: ["xai/*"] });
+
+		// The registry's own settings allow xAI; only the session settings deny it.
+		await runSearchQuery({ query: "site:x.com anything" }, { authStorage, modelRegistry, settings });
+
+		expect(attempted.filter(selector => selector.startsWith("xai/"))).toEqual([]);
 	});
 });

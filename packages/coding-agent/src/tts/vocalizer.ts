@@ -39,7 +39,8 @@
  */
 import type { ModelBrowserRegistry } from "@oh-my-pi/pi-tui/overlays/model-browser";
 import { logger } from "@oh-my-pi/pi-utils";
-import { resolveRoleChain } from "../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
+import { configuredRoleDenial, resolveRoleChain } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { type Settings, settings } from "../config/settings";
 import { DEFAULT_TTS_VOICE, TTS_LOCAL_MODELS } from "./models";
@@ -62,13 +63,29 @@ export interface VocalizerModelSource {
 	registry: ModelBrowserRegistry;
 }
 
-/** Resolve the first speech-role candidate that the local streaming worker can run. */
+/**
+ * Resolve the first speech-role candidate that the local streaming worker can run.
+ * Throws the `disabledModels` diagnostic instead of substituting: when a configured
+ * `modelRoles.speech` names only denied models, or when nothing resolves and the
+ * built-in default model is denied.
+ */
 export function resolveLocalSpeechModelId(source: VocalizerModelSource): string {
 	const pool = roleCandidatePool("speech", source.settings, source.registry);
+	const denied = configuredRoleDenial("speech", source.settings, pool);
+	if (denied) throw new Error(formatDisabledModelError(denied.label, denied.rule));
 	const local = resolveRoleChain("speech", source.settings, pool).find(
 		candidate => candidate.model.api === "local-inference",
 	);
-	return local?.model.id ?? TTS_LOCAL_MODELS[0].key;
+	if (local) return local.model.id;
+	return localSpeechDefault(source.settings);
+}
+
+/** The built-in local speech model, or the `disabledModels` diagnostic (thrown) when it is denied. */
+function localSpeechDefault(sessionSettings: Settings): string {
+	const fallback = TTS_LOCAL_MODELS[0].key;
+	const rule = disabledModelRule({ provider: "local", id: fallback }, sessionSettings);
+	if (rule !== undefined) throw new Error(formatDisabledModelError(`local/${fallback}`, rule));
+	return fallback;
 }
 
 export interface VocalizerPlayer {
@@ -329,6 +346,7 @@ export class Vocalizer {
 			const segments = utterance.speakable.push(spoken.endsWith("\n") ? spoken : `${spoken}\n`);
 			if (segments.length === 0) return;
 			if (!utterance.handle) utterance.handle = this.#openSession(utterance.abort);
+			if (!utterance.handle) return;
 			for (const segment of segments) utterance.handle.push(segment);
 		});
 	}
@@ -369,6 +387,7 @@ export class Vocalizer {
 			const abort = new AbortController();
 			this.#liveAborts.add(abort);
 			this.#handle = this.#openSession(abort);
+			if (!this.#handle) return;
 		}
 		for (const segment of segments) this.#handle.push(segment);
 	}
@@ -377,10 +396,17 @@ export class Vocalizer {
 	 * Open a streaming-synthesis session and chain its playback after any
 	 * prior utterance's, so sequential utterances never overlap.
 	 */
-	#openSession(abort: AbortController): TtsStreamHandle {
+	#openSession(abort: AbortController): TtsStreamHandle | null {
 		const source = this.#modelSource;
-		const modelKey = source ? resolveLocalSpeechModelId(source) : TTS_LOCAL_MODELS[0].key;
 		const sessionSettings = source?.settings ?? settings;
+		let modelKey: string;
+		try {
+			modelKey = source ? resolveLocalSpeechModelId(source) : localSpeechDefault(sessionSettings);
+		} catch (error) {
+			logger.warn(error instanceof Error ? error.message : String(error));
+			this.#liveAborts.delete(abort);
+			return null;
+		}
 		const voice = cfgSpeechVoice.get(sessionSettings) || DEFAULT_TTS_VOICE;
 		const speed = cfgSpeechSpeed.get(sessionSettings);
 		const handle = ttsClient.synthesizeStream(modelKey, { voice, speed, signal: abort.signal });

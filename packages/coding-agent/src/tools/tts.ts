@@ -8,7 +8,8 @@ import { MissingApiKeyError, ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { DEFAULT_XAI_VOICE_ID, synthesizeSpeech, XAI_MAX_TEXT_LENGTH } from "@oh-my-pi/pi-ai/speech";
 import { prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
+import { configuredRoleDenial, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { settings, type Settings } from "../config/settings";
 import type { CustomTool, CustomToolContext } from "../extensibility/custom-tools/types";
@@ -197,6 +198,18 @@ export const ttsTool: CustomTool<typeof ttsSchema, TtsToolDetails> = {
 		const codec: TtsCodec = outputPath.toLowerCase().endsWith(".wav") ? "wav" : "mp3";
 
 		const settingsInstance = ctx.settings ?? settings;
+		// A configured `speech` role that names only denied models is refused, not replaced by another model.
+		const denied = configuredRoleDenial(
+			"speech",
+			settingsInstance,
+			roleCandidatePool("speech", settingsInstance, ctx.modelRegistry),
+		);
+		if (denied) {
+			return {
+				isError: true,
+				content: [{ type: "text", text: formatDisabledModelError(denied.label, denied.rule) }],
+			};
+		}
 		const candidates = resolveSpeechCandidates(settingsInstance, ctx.modelRegistry, codec === "mp3");
 		if (candidates.length === 0) {
 			return {
@@ -207,6 +220,11 @@ export const ttsTool: CustomTool<typeof ttsSchema, TtsToolDetails> = {
 
 		const failures: string[] = [];
 		for (const { model } of candidates) {
+			const deniedBy = disabledModelRule(model, settingsInstance);
+			if (deniedBy !== undefined) {
+				failures.push(formatDisabledModelError(model, deniedBy));
+				continue;
+			}
 			try {
 				if (model.api === "local-inference") {
 					return await synthesizeLocal(model, params, settingsInstance, cwd, outputPath, signal);

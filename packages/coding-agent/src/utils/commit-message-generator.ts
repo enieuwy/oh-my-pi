@@ -8,6 +8,7 @@ import { completeSimple, retryTransientCompletion } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
+import { formatDisabledModelError, withoutDisabledModels } from "../config/disabled-models";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import MODEL_PRIO from "../priority.json" with { type: "json" };
@@ -45,7 +46,7 @@ function getSmolModelCandidates(
 	registry: ModelRegistry,
 	settings: Settings,
 ): Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> {
-	const availableModels = registry.getAvailable();
+	const availableModels = withoutDisabledModels(registry.getAvailable(), settings);
 	if (availableModels.length === 0) return [];
 
 	const candidates: Array<{ model: Model<Api>; thinkingLevel?: ThinkingLevel }> = [];
@@ -60,6 +61,13 @@ function getSmolModelCandidates(
 		settings,
 		matchPreferences,
 	});
+	// A configured `smol` role that names only denied models is refused, not replaced by other models.
+	if (configuredSmol.disabledModel) {
+		logger.warn("commit-msg-generator: smol model refused", {
+			reason: formatDisabledModelError(configuredSmol.disabledModel.label, configuredSmol.disabledModel.rule),
+		});
+		return [];
+	}
 	addCandidate(configuredSmol.model, concreteThinkingLevel(configuredSmol.thinkingLevel));
 
 	for (const pattern of MODEL_PRIO.smol) {

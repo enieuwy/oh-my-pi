@@ -10,15 +10,17 @@
  * that fails before its reply starts moves on to the next candidate. Serving
  * ends when stdin does.
  */
-import type { Api, Model } from "@oh-my-pi/pi-ai";
-import { createAuthGatewayRouter, serveAuthGatewayStdio } from "@oh-my-pi/pi-ai/auth-gateway";
+import type { Api, AuthStorage, Model } from "@oh-my-pi/pi-ai";
+import { type AuthGatewayRouter, createAuthGatewayRouter, serveAuthGatewayStdio } from "@oh-my-pi/pi-ai/auth-gateway";
 import { getProjectDir, isRecord, logger, postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import { formatDisabledModelError } from "../config/disabled-models";
 import { ModelRegistry } from "../config/model-registry";
 import { formatModelStringWithRouting, normalizeModelPatternList, resolveCliModel } from "../config/model-resolver";
 import { Settings } from "../config/settings";
 import { claimRpcInput } from "../modes/rpc/rpc-input";
 import { discoverAuthStorage, loadCliExtensionProviders } from "../sdk";
 import { collectOnlineTinyCandidates, expandOnlineTinyModelFallbacks } from "../tiny/online-candidates";
+import { gatewayRequestRefusal } from "./auth-gateway-cli";
 
 /** Names the caller in the gateway's logs. */
 const STDIO_PEER = "stdio";
@@ -52,26 +54,53 @@ export function selectorCandidates(
 	return [];
 }
 
-/** Serves the gateway on stdin/stdout until stdin ends, then exits. */
-export async function runAuthGatewayStdio(): Promise<void> {
-	// Claimed before extension discovery so no in-process module can read the protocol's input.
-	const input = claimRpcInput();
-	const cwd = getProjectDir();
-	const settings = await Settings.init({ cwd });
-	const storage = await discoverAuthStorage(undefined, { settings });
-	const registry = new ModelRegistry(storage);
-	await registry.refresh();
-	await loadCliExtensionProviders(registry, settings, cwd);
+/**
+ * The `disabledModels` denial for `selector` when no entry resolves: the first
+ * denied entry's diagnostic, so a denied model reads as refused, not unknown.
+ */
+export function selectorDenial(
+	selector: string,
+	settings: Settings,
+	registry: Pick<ModelRegistry, "getAll" | "getAvailable">,
+): string | undefined {
+	for (const pattern of normalizeModelPatternList(selector)) {
+		const { model, disabledModel } = resolveCliModel({ cliModel: pattern, modelRegistry: registry, settings });
+		if (model) return undefined;
+		if (disabledModel) return formatDisabledModelError(disabledModel.label, disabledModel.rule);
+	}
+	return undefined;
+}
 
-	// Candidates are routed by their exact `provider/id[@upstream]`, so the
-	// router only ever resolves a model this process picked for the request.
-	const routed = new Map<string, Model<Api>>();
-	const router = createAuthGatewayRouter({
+/**
+ * The gateway router for the stdio host: it resolves only models in `routed` and refuses a
+ * request that `disabledModels` denies under its routing options, as the HTTP host does.
+ */
+export function createStdioGatewayRouter(
+	storage: AuthStorage,
+	registry: Pick<ModelRegistry, "getAvailable">,
+	settings: Settings,
+	routed: ReadonlyMap<string, Model<Api>>,
+): AuthGatewayRouter {
+	return createAuthGatewayRouter({
 		storage,
 		resolveModel: id => routed.get(id),
 		listModels: () => registry.getAvailable(),
+		requestRefusal: (model, options) => gatewayRequestRefusal(model, options, settings),
 	});
-	const route = async (req: Request): Promise<Response> => {
+}
+
+/**
+ * The stdio host's request handler: it picks the models a request's selector names, tries them in
+ * order through `router`, and answers 403 with the `disabledModels` diagnostic when the selector
+ * names only denied models, 404 when it names nothing.
+ */
+export function createStdioRoute(
+	router: Pick<AuthGatewayRouter, "route">,
+	routed: Map<string, Model<Api>>,
+	settings: Settings,
+	registry: Pick<ModelRegistry, "getAll" | "getAvailable">,
+): (req: Request) => Promise<Response> {
+	return async req => {
 		// Unparseable bodies pass through for the route to reject in its own wire format.
 		const body: unknown = req.body
 			? await req
@@ -82,10 +111,14 @@ export async function runAuthGatewayStdio(): Promise<void> {
 		if (!isRecord(body) || typeof body.model !== "string") return router.route(req, STDIO_PEER);
 		const selector = body.model;
 		const candidates = selectorCandidates(selector, settings, registry);
-		let response = Response.json(
-			{ error: { message: `No available model matches "${selector}"`, type: "invalid_request_error" } },
-			{ status: 404 },
-		);
+		const denial = candidates.length === 0 ? selectorDenial(selector, settings, registry) : undefined;
+		let response =
+			denial === undefined
+				? Response.json(
+						{ error: { message: `No available model matches "${selector}"`, type: "invalid_request_error" } },
+						{ status: 404 },
+					)
+				: Response.json({ error: { message: denial, type: "permission_error" } }, { status: 403 });
 		for (const model of candidates) {
 			const key = formatModelStringWithRouting(model);
 			routed.set(key, model);
@@ -101,6 +134,24 @@ export async function runAuthGatewayStdio(): Promise<void> {
 		}
 		return response;
 	};
+}
+
+/** Serves the gateway on stdin/stdout until stdin ends, then exits. */
+export async function runAuthGatewayStdio(): Promise<void> {
+	// Claimed before extension discovery so no in-process module can read the protocol's input.
+	const input = claimRpcInput();
+	const cwd = getProjectDir();
+	const settings = await Settings.init({ cwd });
+	const storage = await discoverAuthStorage(undefined, { settings });
+	const registry = new ModelRegistry(storage);
+	await registry.refresh();
+	await loadCliExtensionProviders(registry, settings, cwd);
+
+	// Candidates are routed by their exact `provider/id[@upstream]`, so the
+	// router only ever resolves a model this process picked for the request.
+	const routed = new Map<string, Model<Api>>();
+	const router = createStdioGatewayRouter(storage, registry, settings, routed);
+	const route = createStdioRoute(router, routed, settings, registry);
 
 	try {
 		await serveAuthGatewayStdio({ input, write: line => process.stdout.write(line), route, version: VERSION });

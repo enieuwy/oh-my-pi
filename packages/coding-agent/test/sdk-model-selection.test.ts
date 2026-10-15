@@ -10,10 +10,11 @@ import { resolveModelCacheProviderId } from "@oh-my-pi/pi-catalog/provider-model
 import { DEFAULT_MODEL_PER_PROVIDER } from "@oh-my-pi/pi-catalog/provider-models/descriptors";
 import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
 import { ModelRegistry, type ProviderConfigInput } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { cfgEnabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { getModelMatchPreferences, resolveModelScope } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { buildSessionOptions as buildCliSessionOptions } from "@oh-my-pi/pi-coding-agent/main";
-import { createAgentSession, type ExtensionFactory } from "@oh-my-pi/pi-coding-agent/sdk";
+import { createAgentSession, type ExtensionFactory, resolvePrewalkTarget } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as discoveryModule from "@oh-my-pi/pi-coding-agent/task/discovery";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import { getBundledAgent } from "@oh-my-pi/pi-coding-agent/task/agents";
@@ -401,6 +402,88 @@ describe("createAgentSession deferred model pattern resolution", () => {
 		} finally {
 			await session.dispose();
 		}
+	});
+
+	test("refuses a modelRoles.default that names a denied model instead of auto-picking another", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.keys.setRuntime("anthropic", "anthropic-test-key");
+		authStorage.keys.setRuntime("openai", "openai-test-key");
+		const settings = Settings.isolated({
+			enabledModels: ["openai/*"],
+			disabledModels: ["openai/gpt-4o-*"],
+			modelRoles: { default: "openai/gpt-4o-mini" },
+		});
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "denied-default-models.yml"), {
+			settings,
+		});
+
+		const { session, modelFallbackMessage } = await createAgentSession({
+			cwd: tempDir,
+			agentDir: tempDir,
+			authStorage,
+			modelRegistry,
+			settings,
+			sessionManager: SessionManager.inMemory(),
+			disableExtensionDiscovery: true,
+			skills: [],
+			contextFiles: [],
+			promptTemplates: [],
+			slashCommands: [],
+			enableMCP: false,
+			enableLsp: false,
+			skipPythonPreflight: true,
+			rules: [],
+			preloadedCustomToolPaths: [],
+			toolNames: ["read"],
+		});
+
+		try {
+			expect(session.model).toBeUndefined();
+			expect(modelFallbackMessage).toBe(
+				'Model "openai/gpt-4o-mini" is disabled by disabledModels rule "openai/gpt-4o-*". Remove or narrow that rule to use it.',
+			);
+			// The stored role is never rewritten because it is denied.
+			expect(settings.getModelRole("default")).toBe("openai/gpt-4o-mini");
+			expect(cfgEnabledModels.get(settings)).toEqual(["openai/*"]);
+		} finally {
+			await session.dispose();
+		}
+	});
+
+	test("refuses a prewalk target the session denies even when the registry's settings allow it", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		authStoragesToClose.push(authStorage);
+		authStorage.keys.setRuntime("openai", "openai-test-key");
+		const modelRegistry = new ModelRegistry(authStorage, path.join(tempDir, "prewalk-models.yml"), {
+			settings: Settings.isolated({}),
+		});
+		const settings = Settings.isolated({ disabledModels: ["openai/gpt-4o-mini"] });
+		const preferences = getModelMatchPreferences(settings);
+
+		const denied = await resolvePrewalkTarget(
+			["openai/gpt-4o-mini"],
+			"openai/gpt-4o-mini",
+			modelRegistry,
+			preferences,
+			new Set(),
+			{ settings },
+		);
+		expect(denied.prewalk).toBeUndefined();
+		expect(denied.disabledModel?.rule).toBe("openai/gpt-4o-mini");
+		expect(denied.warnings.join("\n")).toContain('disabledModels rule "openai/gpt-4o-mini"');
+
+		const allowed = await resolvePrewalkTarget(
+			["openai/gpt-4o"],
+			"openai/gpt-4o",
+			modelRegistry,
+			preferences,
+			new Set(),
+			{
+				settings,
+			},
+		);
+		expect(allowed.prewalk?.target.id).toBe("gpt-4o");
 	});
 
 	test("defers online runtime discovery until the UI starts it after first paint", async () => {

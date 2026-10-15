@@ -466,6 +466,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
 				const match = resolved.model;
 				if (!match) {
+					if (resolved.disabledModel && resolved.error) return usage(resolved.error, runtime);
 					return usage(
 						`Unknown model: ${selector}. Use ACP \`session/setModel\` for picker-driven selection or list available models with /model.`,
 						runtime,
@@ -518,7 +519,12 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				return commandConsumed();
 			}
 			const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
-			if (!resolved.model) return usage(`Unknown model: ${selector}`, runtime);
+			if (!resolved.model) {
+				return usage(
+					resolved.disabledModel && resolved.error ? resolved.error : `Unknown model: ${selector}`,
+					runtime,
+				);
+			}
 			try {
 				await runtime.session.setModelTemporary(resolved.model, resolved.thinkingLevel);
 				await runtime.output(`Session-only model: ${formatModelString(resolved.model)}.`);
@@ -538,7 +544,9 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			}
 			const resolved = resolveSessionModelSelector(selector, runtime.ctx.session, runtime.ctx.settings);
 			if (!resolved.model) {
-				runtime.ctx.showError(`Unknown model: ${selector}`);
+				runtime.ctx.showError(
+					resolved.disabledModel && resolved.error ? resolved.error : `Unknown model: ${selector}`,
+				);
 				return;
 			}
 			if (resolved.warning) runtime.ctx.showStatus(resolved.warning);

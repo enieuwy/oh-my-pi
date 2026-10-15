@@ -42,7 +42,13 @@ import * as AIError from "@oh-my-pi/pi-ai/error";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { ModelRegistry } from "../config/model-registry";
-import { formatModelStringWithRouting, resolveRoleChain, type RoleChainCandidate } from "../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
+import {
+	configuredRoleDenial,
+	formatModelStringWithRouting,
+	resolveRoleChain,
+	type RoleChainCandidate,
+} from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import type { SessionManager } from "../session/session-manager";
@@ -170,8 +176,13 @@ function cachedJudgeRoleChain(settings: Settings, registry: RegistryWithRejectio
 }
 
 /** Append the session model when no candidate is native and the chain does not already route to it. */
-function withSessionFallback(candidates: RoleChainCandidate[], sessionModel: Model | undefined): RoleChainCandidate[] {
-	if (!sessionModel || candidates.some(candidate => kindOf(candidate) === "native")) return candidates;
+function withSessionFallback(
+	candidates: RoleChainCandidate[],
+	sessionModel: Model | undefined,
+	settings: Settings,
+): RoleChainCandidate[] {
+	if (!sessionModel || disabledModelRule(sessionModel, settings) !== undefined) return candidates;
+	if (candidates.some(candidate => kindOf(candidate) === "native")) return candidates;
 	const sessionIdentity = formatModelStringWithRouting(sessionModel);
 	if (candidates.some(candidate => formatModelStringWithRouting(candidate.model) === sessionIdentity)) {
 		return candidates;
@@ -199,7 +210,10 @@ export function kindOf(value: RoleChainCandidate | Model): JudgeKind {
  * judgment, whose calibrated probabilities it cannot reproduce.
  */
 function judgeRoleChain(settings: Settings, registry: ModelRegistry): RoleChainCandidate[] {
-	const chain = resolveRoleChain("judge", settings, roleCandidatePool("judge", settings, registry));
+	const pool = roleCandidatePool("judge", settings, registry);
+	// A configured `judge` role that names only denied models yields no chain; `ChainJudge` reports why.
+	if (configuredRoleDenial("judge", settings, pool)) return [];
+	const chain = resolveRoleChain("judge", settings, pool);
 	const firstNative = chain.findIndex(candidate => kindOf(candidate) === "native");
 	if (firstNative < 0) return chain;
 	return chain.filter((candidate, index) => index < firstNative || kindOf(candidate) === "native");
@@ -257,6 +271,14 @@ export class ChainJudge implements Judge {
 		const signal = options.signal;
 		let lastFailure: string | undefined;
 		let lastUnavailable: string | undefined;
+		// A configured `judge` role that names only denied models is refused, not replaced by the
+		// fallback chain or the session model.
+		const denied = configuredRoleDenial(
+			"judge",
+			this.#deps.settings,
+			roleCandidatePool("judge", this.#deps.settings, this.#deps.registry),
+		);
+		if (denied) throw new Error(`judgment: ${formatDisabledModelError(denied.label, denied.rule)}`);
 		const candidates = this.#resolveCandidates();
 		const rejections = this.#rejections();
 		for (const candidate of candidates) {
@@ -327,13 +349,18 @@ export class ChainJudge implements Judge {
 		const { settings, registry, sessionModel } = this.#deps;
 		const candidates = cachedJudgeRoleChain(settings, registry);
 		if (candidates === this.#candidates?.chain) return this.#candidates.list;
-		const list = withSessionFallback(candidates, sessionModel);
+		const list = withSessionFallback(candidates, sessionModel, settings);
 		this.#candidates = { chain: candidates, list };
 		return list;
 	}
 
 	async #createJudge(candidate: RoleChainCandidate, signal: AbortSignal | undefined): Promise<Judge | undefined> {
 		const model = candidate.model;
+		const deniedBy = disabledModelRule(model, this.#deps.settings);
+		if (deniedBy !== undefined) {
+			logger.warn(formatDisabledModelError(model, deniedBy));
+			return undefined;
+		}
 		if (model.api === "local-inference") return new TextJudge(new LocalTextBackend(model.id));
 		if (!(await this.#deps.registry.getApiKey(model, this.#deps.sessionId, { signal }))) return undefined;
 		const apiKey = this.#deps.registry.resolver(model, this.#deps.sessionId);

@@ -8,6 +8,7 @@ import {
 	buildGatewayApiKeyResolver,
 	mirrorRequestAbort,
 	recordGatewayUsage,
+	rejectUnresolvedModel,
 	resolveGatewayApiKey,
 } from "../dispatch";
 import { gatewayResponseHeaders, json, resolveClientIdentity } from "../http";
@@ -32,7 +33,10 @@ export async function handleRerank(bootOpts: AuthGatewayRouteOptions, req: Reque
 	if (controller.signal.aborted) return aborted();
 
 	const model = bootOpts.resolveModel(parsed.modelId);
-	if (!model) return rerankWire.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+	if (!model) {
+		const rejection = rejectUnresolvedModel(bootOpts, parsed.modelId);
+		return rerankWire.formatError(rejection.status, rejection.type, rejection.message);
+	}
 	if (model.api !== "openrouter-rerank") {
 		return rerankWire.formatError(400, "invalid_request_error", `Model ${parsed.modelId} does not support reranking`);
 	}

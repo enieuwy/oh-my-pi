@@ -10,6 +10,7 @@ import {
 	type AuthGatewayRouteOptions,
 	buildGatewayApiKeyResolver,
 	mirrorRequestAbort,
+	rejectUnresolvedModel,
 	resolveGatewayApiKey,
 } from "../dispatch";
 import { gatewayResponseHeaders, json, resolveClientIdentity } from "../http";
@@ -43,11 +44,8 @@ async function resolveVideoJob(
 	}
 	const model = bootOpts.resolveModel(`${identity.provider}/${identity.modelId}`);
 	if (!model) {
-		return videoServer.formatError(
-			404,
-			"invalid_request_error",
-			`Unknown model: ${identity.provider}/${identity.modelId}`,
-		);
+		const rejection = rejectUnresolvedModel(bootOpts, `${identity.provider}/${identity.modelId}`);
+		return videoServer.formatError(rejection.status, rejection.type, rejection.message);
 	}
 	if (model.api !== "openrouter-video") {
 		return videoServer.formatError(
@@ -131,7 +129,10 @@ export async function handleVideoSubmit(
 		return videoServer.formatError(400, "invalid_request_error", message);
 	}
 	const model = bootOpts.resolveModel(parsed.modelId);
-	if (!model) return videoServer.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+	if (!model) {
+		const rejection = rejectUnresolvedModel(bootOpts, parsed.modelId);
+		return videoServer.formatError(rejection.status, rejection.type, rejection.message);
+	}
 	if (model.api !== "openrouter-video") {
 		return videoServer.formatError(
 			400,

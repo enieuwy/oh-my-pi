@@ -393,6 +393,109 @@ describe("imageGenTool catalog routing", () => {
 		expect(result.details?.model).toBe("gpt-image-selected");
 	});
 
+	it("never relays a hosted image through a carrier the session denies", async () => {
+		const image = catalogModel("openai", "gpt-image-selected", "openai-responses");
+		const deniedCarrier = catalogModel("openai", "gpt-5.5", "openai-responses", "chat");
+		const allowedCarrier = catalogModel("openai", "gpt-5.6-sol", "openai-responses", "chat");
+		expect(deniedCarrier.hostedImage).toBe(true);
+		expect(allowedCarrier.hostedImage).toBe(true);
+		const active = catalogModel("anthropic", "claude-sonnet-4-5", "anthropic-messages", "chat");
+		const requestModels: unknown[] = [];
+		const fetchMock: FetchImpl = async (_input, init) => {
+			requestModels.push(JSON.parse(String(init?.body)).model);
+			return hostedResponse();
+		};
+		const settings = Settings.isolated({
+			modelRoles: { image: "openai/gpt-image-selected" },
+			disabledModels: ["openai/gpt-5.5"],
+		});
+		const ctx = createContext({
+			models: [image, deniedCarrier, allowedCarrier],
+			settings,
+			fetch: fetchMock,
+			activeModel: active,
+		});
+		collectPaths(await imageGenTool.execute("denied-carrier", { subject: "x" }, undefined, ctx));
+		expect(requestModels).toEqual(["gpt-5.6-sol"]);
+
+		// With only the denied carrier left, nothing is sent.
+		requestModels.length = 0;
+		const onlyDenied = createContext({
+			models: [image, deniedCarrier],
+			settings,
+			fetch: fetchMock,
+			activeModel: active,
+		});
+		await expect(imageGenTool.execute("denied-only", { subject: "x" }, undefined, onlyDenied)).rejects.toThrow(
+			"hosted chat carrier unavailable",
+		);
+		expect(requestModels).toEqual([]);
+	});
+
+	it("never sends a request for an image target the session denies, including the session model's own imageModel", async () => {
+		const image = catalogModel("deepinfra", "image-x", "openai-images");
+		const chat = {
+			...catalogModel("deepinfra", "chat-x", "openai-completions", "chat"),
+			imageModel: "image-x",
+		};
+		const requests: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			requests.push(input.toString());
+			return imageResponse();
+		};
+		// The registry mock lists every model; only the session settings deny them.
+		const ctx = createContext({
+			models: [image, chat],
+			settings: Settings.isolated({ disabledModels: ["deepinfra/*"] }),
+			fetch: fetchMock,
+			activeModel: chat,
+		});
+
+		await expect(imageGenTool.execute("denied-targets", { subject: "x" }, undefined, ctx)).rejects.toThrow();
+		expect(requests).toEqual([]);
+	});
+
+	it("never sends a request to a denied session model that carries the image tool itself", async () => {
+		const active = {
+			...catalogModel("deepinfra", "chat-x", "openai-images", "chat"),
+			hostedImage: true,
+		};
+		const requests: string[] = [];
+		const fetchMock: FetchImpl = async input => {
+			requests.push(input.toString());
+			return imageResponse();
+		};
+		const ctx = createContext({
+			models: [active],
+			settings: Settings.isolated({ disabledModels: ["deepinfra/*"] }),
+			fetch: fetchMock,
+			activeModel: active,
+		});
+
+		await expect(imageGenTool.execute("denied-active", { subject: "x" }, undefined, ctx)).rejects.toThrow(
+			"is disabled by disabledModels",
+		);
+		expect(requests).toEqual([]);
+	});
+
+	it("does not resolve the session model's imageModel swap to a denied target", async () => {
+		const image = catalogModel("deepinfra", "image-x", "openai-images");
+		const chat = {
+			...catalogModel("deepinfra", "chat-x", "openai-completions", "chat"),
+			imageModel: "image-x",
+		};
+		const ctx = createContext({
+			models: [image, chat],
+			settings: Settings.isolated({ disabledModels: ["deepinfra/*"] }),
+			fetch: async () => imageResponse(),
+			activeModel: chat,
+		});
+
+		const failure = await imageGenTool.execute("denied-swap", { subject: "x" }, undefined, ctx).catch(error => error);
+		expect(failure).toBeInstanceOf(Error);
+		expect((failure as Error).message).not.toContain("deepinfra/image-x");
+	});
+
 	it("lets a hosted-image session model generate by itself when its proxy lacks the swap target", async () => {
 		const proxied = catalogModel("my-proxy", "gpt-5.6-sol", "openai-responses", "chat");
 		expect(proxied.hostedImage).toBe(true);

@@ -324,6 +324,35 @@ describe("ChainJudge", () => {
 		expect(attempted).toEqual([ONLINE.id, ONLINE.id, ONLINE.id, ONLINE_BACKUP.id]);
 	});
 
+	it("never uses a denied session model as the judge fallback", async () => {
+		const deniedRule = `${ONLINE.provider}/${ONLINE.id}`;
+		const settings = Settings.isolated({
+			modelRoles: { judge: `${ONLINE_BACKUP.provider}/${ONLINE_BACKUP.id}` },
+			disabledModels: [deniedRule],
+		});
+		const registry = makeRegistry([ONLINE, ONLINE_BACKUP], { [ONLINE.provider]: "online-key" });
+		const attempted: string[] = [];
+		vi.spyOn(ai, "completeSimple").mockImplementation(async model => {
+			attempted.push(model.id);
+			return reply(model, "unparseable");
+		});
+
+		await expect(
+			new ChainJudge({ settings, registry, purpose: "test", sessionModel: ONLINE }).judge({
+				state: "rename a local",
+				questions: { level: TIER_QUESTION },
+			}),
+		).rejects.toThrow();
+		expect(attempted.length).toBeGreaterThan(0);
+		expect(new Set(attempted)).toEqual(new Set([ONLINE_BACKUP.id]));
+
+		// With no judge role, the denied session model must not become the only candidate either.
+		const unconfigured = Settings.isolated({ disabledModels: [deniedRule] });
+		expect(
+			new ChainJudge({ settings: unconfigured, registry, purpose: "test", sessionModel: ONLINE }).primaryModel(),
+		).toBeUndefined();
+	});
+
 	it("follows a judge role change inside the chain reuse window, agreeing with the native gate", () => {
 		const settings = Settings.isolated({ modelRoles: { judge: `${ONLINE.provider}/${ONLINE.id}` } });
 		const registry = makeRegistry([JEV_PREVIEW, ONLINE], { typesafe: "ts-key", [ONLINE.provider]: "online-key" });

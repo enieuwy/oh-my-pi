@@ -69,6 +69,8 @@ import { isRecord, logger, prompt, Snowflake } from "@oh-my-pi/pi-utils";
 import * as snapcompact from "@oh-my-pi/snapcompact";
 import { writeArtifact } from "./artifacts";
 import type { ModelRegistry } from "../config/model-registry";
+import { disabledModelRule, formatDisabledModelError, withoutDisabledModels } from "../config/disabled-models";
+import { withoutDeniedNativeCompaction } from "./native-compaction-deny";
 import { CHAT_MODEL_ROLE_IDS } from "../config/model-roles";
 import type { Settings } from "../config/settings";
 import type { ExtensionRunner, SessionBeforeCompactResult } from "../extensibility/extensions";
@@ -3445,7 +3447,12 @@ export class SessionMaintenance {
 		// and compact with the window this session's settings select.
 		const registry = this.#host.modelRegistry;
 		const settings = this.#host.settings;
-		availableModels = availableModels.map(model => registry.fitContextWindow(model, settings));
+		// Session-denied models leave the pool before the largest-context scan, so a denied
+		// model never ends the scan before an allowed one (a broader registry may list it).
+		availableModels = withoutDisabledModels(
+			availableModels.map(model => registry.fitContextWindow(model, settings)),
+			settings,
+		);
 		const candidates: Model[] = [];
 		const seen = new Set<string>();
 
@@ -3458,6 +3465,13 @@ export class SessionMaintenance {
 			// scan below doesn't reintroduce them; the filter just suppresses
 			// inclusion in this caller's candidate chain.
 			if (filter && !filter(model)) return;
+			// The registry filters by its own settings; the session's `disabledModels` is enforced here,
+			// before any credential lookup, for every candidate source (target, preferred, roles, fallback).
+			const deniedRule = disabledModelRule(model, settings);
+			if (deniedRule !== undefined) {
+				logger.warn("Compaction candidate skipped", { reason: formatDisabledModelError(model, deniedRule) });
+				return;
+			}
 			candidates.push(model);
 		};
 
@@ -3466,9 +3480,15 @@ export class SessionMaintenance {
 		}
 		addCandidate(preferredModel ?? undefined);
 		for (const role of CHAT_MODEL_ROLE_IDS) {
-			addCandidate(
-				resolveRoleModelFull(this.#host.settings, role, availableModels, preferredModel ?? undefined).model,
-			);
+			const resolved = resolveRoleModelFull(this.#host.settings, role, availableModels, preferredModel ?? undefined);
+			// A role naming only denied models is skipped like an unavailable one; the warning names the rule.
+			if (resolved.disabledModel) {
+				logger.warn("Compaction candidate role skipped", {
+					role,
+					reason: formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule),
+				});
+			}
+			addCandidate(resolved.model);
 		}
 
 		const sortedByContext = [...availableModels].sort((a, b) => (b.contextWindow ?? 0) - (a.contextWindow ?? 0));
@@ -3520,7 +3540,9 @@ export class SessionMaintenance {
 
 			try {
 				return await compact(
-					this.#host.obfuscatePreparationForProvider(preparation),
+					this.#host.obfuscatePreparationForProvider(
+						withoutDeniedNativeCompaction(preparation, candidate, this.#host.settings),
+					),
 					candidate,
 					this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
 					this.#host.obfuscateTextForProvider(customInstructions),
@@ -5313,7 +5335,9 @@ export class SessionMaintenance {
 					while (true) {
 						try {
 							compactResult = await compact(
-								this.#host.obfuscatePreparationForProvider(preparation),
+								this.#host.obfuscatePreparationForProvider(
+									withoutDeniedNativeCompaction(preparation, candidate, this.#host.settings),
+								),
 								candidate,
 								this.#host.modelRegistry.resolver(candidate, this.#host.sessionId()),
 								undefined,
@@ -5340,6 +5364,14 @@ export class SessionMaintenance {
 									providerSessionState: this.#host.providerSessionState,
 									preferWebsockets: this.#host.preferWebsockets(),
 									codexCompaction,
+									completeImpl: async (requestModel, requestContext, requestOptions) => {
+										const stream = await this.#host.sideStreamFn(
+											requestModel,
+											requestContext,
+											requestOptions,
+										);
+										return stream.result();
+									},
 									// This loop already retries the whole compaction attempt on
 									// transient errors, so the summarization oneshots must not
 									// retry too — the budgets would multiply and each outer

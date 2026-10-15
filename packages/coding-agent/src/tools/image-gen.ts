@@ -15,10 +15,16 @@ import {
 import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import { getEffectiveTokenCost } from "@oh-my-pi/pi-catalog/models";
 import { isEnoent, logger, parseImageMetadata, prompt, ptree, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
-import { type RoleChainCandidate, resolveModelRoleValue, resolveRoleChain } from "../config/model-resolver";
+import { disabledModelRule, formatDisabledModelError, withoutDisabledModels } from "../config/disabled-models";
+import {
+	configuredRoleDenial,
+	type RoleChainCandidate,
+	resolveModelRoleValue,
+	resolveRoleChain,
+} from "../config/model-resolver";
 import { roleCandidatePool } from "../config/model-roles";
 import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
-import { settings } from "../config/settings";
+import { type Settings, settings } from "../config/settings";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import imageGenDescription from "../prompts/tools/image-gen.md" with { type: "text" };
 import { resolveConfiguredModelTarget } from "../session/role-models";
@@ -147,11 +153,18 @@ function resolveHostedImageCarrier(
 	modelRegistry: ModelRegistry,
 	selectedModel: Model,
 	activeModel: Model | undefined,
+	settings: Settings,
 ): Model | undefined {
-	if (activeModel?.provider === selectedModel.provider && activeModel.hostedImage) return activeModel;
+	if (
+		activeModel?.provider === selectedModel.provider &&
+		activeModel.hostedImage &&
+		disabledModelRule(activeModel, settings) === undefined
+	) {
+		return activeModel;
+	}
 	let carrier: Model | undefined;
 	let carrierInput = Infinity;
-	for (const model of modelRegistry.getAvailable()) {
+	for (const model of withoutDisabledModels(modelRegistry.getAvailable(), settings)) {
 		if (model.provider !== selectedModel.provider || !model.hostedImage) continue;
 		const input = getEffectiveTokenCost(model.cost).input;
 		if (!carrier || input < carrierInput) {
@@ -248,18 +261,37 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 			const pool = roleCandidatePool("image", effectiveSettings, ctx.modelRegistry);
 			let candidates: Model[];
 			if (params.model) {
-				const selected = resolveModelRoleValue(params.model, pool, { settings: effectiveSettings }).model;
-				if (!selected)
-					throw new Error(`Image model selector did not match an available image model: ${params.model}`);
+				const resolved = resolveModelRoleValue(params.model, pool, { settings: effectiveSettings });
+				const selected = resolved.model;
+				if (!selected) {
+					throw new Error(
+						resolved.disabledModel
+							? formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule)
+							: `Image model selector did not match an available image model: ${params.model}`,
+					);
+				}
 				candidates = [selected];
 			} else {
-				candidates = defaultImageCandidates(resolveRoleChain("image", effectiveSettings, pool), ctx.model, pool);
+				// A configured `image` role that names only denied models is refused, not replaced by another model.
+				const denied = configuredRoleDenial("image", effectiveSettings, pool);
+				if (denied) throw new Error(formatDisabledModelError(denied.label, denied.rule));
+				candidates = defaultImageCandidates(
+					resolveRoleChain("image", effectiveSettings, pool),
+					ctx.model,
+					withoutDisabledModels(pool, effectiveSettings),
+				);
 			}
 
 			const failures: ProviderHttpError[] = [];
 			const skipped: string[] = [];
 			let inputImages: ImageGenerationRequest["inputImages"];
 			for (const model of candidates) {
+				// Registry and role pool may carry other settings; the session's rules gate every concrete target.
+				const deniedRule = disabledModelRule(model, effectiveSettings);
+				if (deniedRule !== undefined) {
+					skipped.push(`${model.provider}/${model.id} (${formatDisabledModelError(model, deniedRule)})`);
+					continue;
+				}
 				if (!isImageGenerationApi(model.api)) {
 					logger.warn("Skipping unsupported image model API", {
 						provider: model.provider,
@@ -283,9 +315,18 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 				let carrier: Model | undefined;
 				let apiKey = ctx.modelRegistry.resolver(model, sessionId);
 				if (model.api === "openai-responses" || model.api === "openai-codex-responses") {
-					carrier = model.hostedImage ? model : resolveHostedImageCarrier(ctx.modelRegistry, model, ctx.model);
+					carrier = model.hostedImage
+						? model
+						: resolveHostedImageCarrier(ctx.modelRegistry, model, ctx.model, effectiveSettings);
 					if (!carrier) {
 						skipped.push(`${model.provider}/${model.id} (hosted chat carrier unavailable)`);
+						continue;
+					}
+					const carrierRule = disabledModelRule(carrier, effectiveSettings);
+					if (carrierRule !== undefined) {
+						skipped.push(
+							`${model.provider}/${model.id} (carrier ${formatDisabledModelError(carrier, carrierRule)})`,
+						);
 						continue;
 					}
 					const carrierKey = await ctx.modelRegistry.getApiKey(carrier, sessionId, { signal: requestSignal });

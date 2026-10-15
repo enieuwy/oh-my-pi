@@ -1,13 +1,14 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
-import { Agent, type AgentMessage, type CompactionSummaryMessage } from "@oh-my-pi/pi-agent-core";
+import { Agent, type AgentMessage, type CompactionSummaryMessage, type StreamFn } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
 import { calculateContextTokens, resolveThresholdTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import { buildOpenAiNativeHistory } from "@oh-my-pi/pi-agent-core/compaction/openai";
-import type { AssistantMessage, Model, OpenAIResponsesHistoryPayload } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, type Model, type OpenAIResponsesHistoryPayload, streamSimple } from "@oh-my-pi/pi-ai";
 import { convertAnthropicMessages } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { createMockModel, type MockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { buildParams } from "@oh-my-pi/pi-ai/providers/openai-responses";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { cfgDisabledModels } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { estimateToolSchemaTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
@@ -39,6 +40,18 @@ interface MaintenanceHarness {
 interface AdvisorCompactionSummaryFixture extends CompactionSummaryMessage {
 	advisorUsageAnchorStartIndex?: number;
 	preserveData?: compactionModule.CompactionResult["preserveData"];
+}
+
+/**
+ * Advisor requests stream through `advisorMock`. Summarization requests to another
+ * registered mock model keep their own routing, as in production where the advisor
+ * stream function wraps the real transport.
+ */
+function advisorStreamFor(advisorMock: MockModel): StreamFn {
+	return (model, context, options) =>
+		model.api === advisorMock.api && model.id !== advisorMock.id
+			? streamSimple(model, context, options)
+			: advisorMock.stream(model, context, options);
 }
 
 describe("AgentSession advisor context maintenance", () => {
@@ -92,7 +105,7 @@ describe("AgentSession advisor context maintenance", () => {
 			settings,
 			modelRegistry,
 			advisorTools: [],
-			advisorStreamFn: advisorMock.stream,
+			advisorStreamFn: advisorStreamFor(advisorMock),
 		});
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		const advisor = session.getAdvisorAgent();
@@ -205,7 +218,7 @@ describe("AgentSession advisor context maintenance", () => {
 			settings,
 			modelRegistry,
 			advisorTools: [],
-			advisorStreamFn: advisorMock.stream,
+			advisorStreamFn: advisorStreamFor(advisorMock),
 		});
 		expect(session.setAdvisorEnabled(true)).toBe(true);
 		const advisor = session.getAdvisorAgent();
@@ -1065,5 +1078,43 @@ describe("AgentSession advisor context maintenance", () => {
 		// A report made after the rewrite describes the context as it is now.
 		advisor.state.messages.push(usageAnchor(advisorMock, prunedAt + 500));
 		expect(session.getAdvisorStats().contextTokens).toBeGreaterThanOrEqual(anchored);
+	});
+
+	it("does not request natively a denied remoteCompaction.model from advisor compaction", async () => {
+		const { advisor, nativeModel, sameProviderModel, settings } = createAdvisorFallbackHarness();
+		cfgDisabledModels.set(settings, [`${nativeModel.provider}/denied-replacement`]);
+		const active = {
+			...nativeModel,
+			remoteCompaction: { ...nativeModel.remoteCompaction, model: "denied-replacement" },
+		};
+		advisor.setModel(active);
+		vi.spyOn(session.modelRegistry, "getAvailable").mockReturnValue([active, sameProviderModel]);
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "portable advisor summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 42,
+		}));
+
+		await session.prompt("small current update");
+
+		expect(compactSpy.mock.calls.map(([preparation]) => preparation.settings.remoteEnabled)).toEqual([false]);
+	});
+
+	it("sends advisor compaction requests through the advisor stream function", async () => {
+		const { advisor, advisorMock } = createAdvisorFallbackHarness();
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "advisor summary",
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: 42,
+		}));
+
+		await session.prompt("small current update");
+
+		const completeImpl = compactSpy.mock.calls[0]?.[5]?.completeImpl;
+		expect(completeImpl).toBeDefined();
+		const before = advisorMock.calls.length;
+		// The mock has no response left for this call; only the routing is observed.
+		await completeImpl!(advisor.state.model, { messages: [] }, { apiKey: "test-key" }).catch(() => undefined);
+		expect(advisorMock.calls.length).toBe(before + 1);
 	});
 });

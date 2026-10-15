@@ -173,4 +173,19 @@ describe("describeAttachedImagesForTextModel", () => {
 		expect(blocks).toHaveLength(1);
 		expect(blocks[0]!.text).toContain("No vision-capable model");
 	});
+
+	it("refuses the denied default role when the configured vision role is unavailable", async () => {
+		const stub = makeCompleteStub("should not be used");
+		const deps = makeDeps(testDir, [textModel, visionModel], stub.fn);
+		deps.settings = Settings.isolated({
+			disabledModels: ["openai/gpt-4o"],
+			modelRoles: { vision: "openai/not-installed", default: "openai/gpt-4o" },
+		});
+		const blocks = await describeAttachedImagesForTextModel(
+			[{ type: "image", data: TINY_PNG_BASE64, mimeType: "image/png" }],
+			deps,
+		);
+		expect(stub.calls).toHaveLength(0);
+		expect(blocks[0]!.text).toContain('disabled by disabledModels rule "openai/gpt-4o"');
+	});
 });

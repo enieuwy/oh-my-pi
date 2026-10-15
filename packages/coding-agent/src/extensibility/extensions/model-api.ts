@@ -7,6 +7,7 @@
  * duplicating resolution/family heuristics.
  */
 import type { Api, Model } from "@oh-my-pi/pi-ai";
+import { withoutDisabledModels } from "../../config/disabled-models";
 import type { ModelRegistry } from "../../config/model-registry";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../../config/model-resolver";
 import type { Settings } from "../../config/settings";
@@ -22,7 +23,7 @@ export function createExtensionModelQuery(
 	getModel: () => Model | undefined,
 ): ExtensionModelQuery {
 	return {
-		list: () => modelRegistry.getAvailable(),
+		list: () => withoutDisabledModels(modelRegistry.getAvailable(), settings),
 		current: () => getModel(),
 		// resolveModelRoleValue expands a role alias (`@slow`) to its full configured
 		// priority list and tries each pattern — the same path core selection uses — so a

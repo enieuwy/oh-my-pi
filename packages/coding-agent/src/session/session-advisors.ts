@@ -74,14 +74,17 @@ import {
 	slugifyAdvisorName,
 } from "../advisor";
 import { evictStaleToolResults } from "../advisor/tool-result-eviction";
+import { disabledModelRule, disabledSelectorRule, formatDisabledModelError } from "../config/disabled-models";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelString,
 	formatModelStringWithRouting,
+	getModelMatchPreferences,
 	resolveAdvisorRoleSelection,
 	resolveModelOverride,
+	resolveModelRoleValue,
 } from "../config/model-resolver";
-import { MODEL_ROLES } from "../config/model-roles";
+import { formatModelRoleAlias, MODEL_ROLES } from "../config/model-roles";
 import { serviceTierForAllFamilies, serviceTierSettingToTier } from "../config/service-tier";
 import type { Settings } from "../config/settings";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "../cursor";
@@ -119,6 +122,7 @@ import { formatSessionHistoryMarkdown } from "./session-history-format";
 import type { SessionManager } from "./session-manager";
 import { buildSessionMetadata } from "./session-metadata";
 import type { YieldQueue } from "./yield-queue";
+import { withoutDeniedNativeCompaction } from "./native-compaction-deny";
 
 import {
 	cfgAdvisorEvictStaleResults,
@@ -1142,9 +1146,12 @@ export class SessionAdvisors {
 				if (!model) {
 					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
 					if (emitWarnings) {
+						// An explicit override naming a denied model is refused with the rule, not "no model matched".
 						this.#host.emitNotice(
 							"warning",
-							`Advisor "${config.name}": no model matched "${config.model}"`,
+							resolved.disabledModel
+								? `Advisor "${config.name}": ${formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule)}`
+								: `Advisor "${config.name}": no model matched "${config.model}"`,
 							"advisor",
 						);
 					}
@@ -1155,9 +1162,26 @@ export class SessionAdvisors {
 				if (!sel) {
 					this.#advisorStatuses.set(slug, { name: config.name, status: "no_model" });
 					if (emitWarnings) {
-						logger.debug("advisor enabled but no model assigned to the 'advisor' role; advisor inactive", {
-							advisor: config.name,
-						});
+						// A configured `advisor` role that resolves only to denied models is refused with the rule.
+						const denied = resolveModelRoleValue(
+							formatModelRoleAlias("advisor"),
+							this.#host.modelRegistry.getAvailable(),
+							{
+								settings: this.#host.settings,
+								matchPreferences: getModelMatchPreferences(this.#host.settings),
+							},
+						).disabledModel;
+						if (denied) {
+							this.#host.emitNotice(
+								"warning",
+								`Advisor "${config.name}": ${formatDisabledModelError(denied.label, denied.rule)}`,
+								"advisor",
+							);
+						} else {
+							logger.debug("advisor enabled but no model assigned to the 'advisor' role; advisor inactive", {
+								advisor: config.name,
+							});
+						}
 					}
 					continue;
 				}
@@ -1998,6 +2022,30 @@ export class SessionAdvisors {
 		);
 	}
 
+	/**
+	 * Skips an advisor fallback candidate denied by `disabledModels`, warning once
+	 * per walk with the matching rule. Returns true when the candidate is denied.
+	 */
+	#skipDeniedAdvisorFallback(
+		raw: string,
+		resolvedDenial: { label: string; rule: string } | undefined,
+		reported: Set<string>,
+		model?: Model,
+	): boolean {
+		let denied = resolvedDenial ?? disabledSelectorRule(raw, this.#host.settings);
+		if (!denied && model) {
+			const rule = disabledModelRule(model, this.#host.settings);
+			if (rule !== undefined) denied = { label: formatModelString(model), rule };
+		}
+		if (!denied) return false;
+		const message = formatDisabledModelError(denied.label, denied.rule);
+		if (!reported.has(message)) {
+			reported.add(message);
+			this.#host.emitNotice("warning", message, "disabled-models");
+		}
+		return true;
+	}
+
 	/** Release refusal pins so the next review may retry the configured primary. */
 	#releaseRefusalPin(advisor: ActiveAdvisor): void {
 		if (advisor.retryFallback) advisor.retryFallback.pinned = false;
@@ -2031,6 +2079,14 @@ export class SessionAdvisors {
 			this.#host.modelRegistry,
 			this.#host.settings,
 		);
+		// Never restore onto a denied primary; stay on the fallback.
+		if (
+			resolvedPrimary.disabledModel ||
+			disabledSelectorRule(originalSelector.raw, this.#host.settings) ||
+			(resolvedPrimary.model && disabledModelRule(resolvedPrimary.model, this.#host.settings))
+		) {
+			return;
+		}
 		const primaryModel =
 			resolvedPrimary.model ?? this.#host.modelRegistry.find(originalSelector.provider, originalSelector.id);
 		if (!primaryModel || !this.#canReplayAdvisorHistory(advisor, primaryModel)) return;
@@ -2179,12 +2235,15 @@ export class SessionAdvisors {
 			isClassifierRefusal(assistantFailure) &&
 			(advisor.retryFallback === undefined || advisor.retryFallback.originalSelector === currentSelector);
 		if (!primaryRefused) this.#host.noteRetryFallbackCooldown(currentSelector, retryAfterMs, message);
+		const reportedDenials = new Set<string>();
 		for (const role of chainKeys) {
 			for (const selector of this.#host.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
 				if (this.#host.isRetryFallbackSelectorSuppressed(selector)) continue;
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
+				if (this.#skipDeniedAdvisorFallback(selector.raw, resolved.disabledModel, reportedDenials)) continue;
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
 				if (!candidate || modelsAreEqual(candidate, currentModel)) continue;
+				if (this.#skipDeniedAdvisorFallback(selector.raw, undefined, reportedDenials, candidate)) continue;
 				if (!this.#canReplayAdvisorHistory(advisor, candidate)) continue;
 				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, advisor.providerSessionId, { signal });
 				if (!apiKey) continue;
@@ -2508,7 +2567,7 @@ export class SessionAdvisors {
 				: undefined;
 			try {
 				compactResult = await compact(
-					candidatePreparation,
+					withoutDeniedNativeCompaction(candidatePreparation, candidate, this.#host.settings),
 					candidate,
 					this.#host.modelRegistry.resolver(candidate, advisorProviderSessionId),
 					undefined,
@@ -2528,6 +2587,14 @@ export class SessionAdvisors {
 						providerSessionState: this.#host.providerSessionState,
 						preferWebsockets: this.#host.preferWebsockets(),
 						codexCompaction,
+						completeImpl: async (requestModel, requestContext, requestOptions) => {
+							const stream = await (this.#advisorStreamFn ?? streamSimple)(
+								requestModel,
+								requestContext,
+								requestOptions,
+							);
+							return stream.result();
+						},
 					},
 				);
 				break;

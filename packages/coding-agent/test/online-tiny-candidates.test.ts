@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { describe, expect, it, spyOn } from "bun:test";
+import { logger } from "@oh-my-pi/pi-utils";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { getRoleInfo } from "@oh-my-pi/pi-coding-agent/config/model-roles";
 import { formatModelStringWithRouting } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
@@ -143,6 +144,43 @@ describe("online tiny fallback candidates", () => {
 				candidate => `${candidate.model.provider}/${candidate.model.id}`,
 			),
 		).toEqual([`${routed.provider}/${routed.id}`, `${fallback.provider}/${fallback.id}`]);
+	});
+
+	it("never returns a denied seed model from expandOnlineTinyModelFallbacks but keeps its allowed fallbacks", () => {
+		const warn = spyOn(logger, "warn");
+		const settings = Settings.isolated({
+			disabledModels: [primarySelector],
+			"retry.fallbackChains": { [primarySelector]: [fallbackSelector] },
+		});
+		expect(expandOnlineTinyModelFallbacks(primary, settings, models)).toEqual([fallback]);
+		expect(warn.mock.calls.map(call => String(call[0])).join("\n")).toContain(
+			`Model "${primarySelector}" is disabled by disabledModels rule "${primarySelector}". Remove or narrow that rule to use it.`,
+		);
+		warn.mockRestore();
+	});
+
+	it("stops the role walk at a configured tiny role that names only denied models", () => {
+		const warn = spyOn(logger, "warn");
+		const settings = Settings.isolated({ disabledModels: [primarySelector], "retry.modelFallback": true });
+		settings.setModelRole("tiny", primarySelector);
+		settings.setModelRole("commit", fallbackSelector);
+		expect(collectOnlineTinyCandidates(["tiny", "commit", "smol"], settings, models)).toEqual([]);
+		warn.mockRestore();
+	});
+
+	it("never restores a denied fallback through the exact lookup and keeps later allowed fallbacks", () => {
+		const warn = spyOn(logger, "warn");
+		const settings = Settings.isolated({
+			disabledModels: [secondarySelector],
+			"retry.fallbackChains": { tiny: [secondarySelector, fallbackSelector] },
+		});
+		settings.setModelRole("tiny", primarySelector);
+		// The caller's pool still lists the denied model, as with a broader SDK-supplied registry.
+		expect(collectOnlineTinyCandidates(["tiny"], settings, models).map(candidate => candidate.model)).toEqual([
+			primary,
+			fallback,
+		]);
+		warn.mockRestore();
 	});
 
 	it("keeps distinct @upstream routes for the same aggregator model", () => {

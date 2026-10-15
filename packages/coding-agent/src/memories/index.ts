@@ -16,6 +16,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 
 import type { ModelRegistry } from "../config/model-registry";
+import { disabledModelRule, formatDisabledModelError } from "../config/disabled-models";
 import { getModelMatchPreferences, resolveModelRoleValue } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import { redactMemorySecrets as redactSecrets } from "../memory-backend/redact";
@@ -1358,15 +1359,27 @@ async function resolveMemoryModel(options: {
 	fallbackRole: string;
 }): Promise<Model | undefined> {
 	const { modelRegistry, session, fallbackRole } = options;
-	const requestedModel = session.settings.getModelRole(fallbackRole) || session.settings.getModelRole("default");
+	const { settings } = session;
+	// The catalog is unfiltered; denied models never serve as the memory model.
+	const catalog = modelRegistry.getAll().filter(model => disabledModelRule(model, settings) === undefined);
+	const requestedModel = settings.getModelRole(fallbackRole) || settings.getModelRole("default");
 	if (requestedModel) {
-		const resolved = resolveModelRoleValue(requestedModel, modelRegistry.getAll(), {
-			settings: session.settings,
-			matchPreferences: getModelMatchPreferences(session.settings),
+		const resolved = resolveModelRoleValue(requestedModel, catalog, {
+			settings,
+			matchPreferences: getModelMatchPreferences(settings),
 		});
 		if (resolved.model) return resolved.model;
+		// A configured role that names only denied models is refused, not replaced by another model.
+		if (resolved.disabledModel) {
+			logger.warn("Memory model refused", {
+				role: fallbackRole,
+				reason: formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule),
+			});
+			return undefined;
+		}
 	}
-	return session.model ?? modelRegistry.getAll()[0];
+	if (session.model && disabledModelRule(session.model, settings) === undefined) return session.model;
+	return catalog[0];
 }
 
 function loadMemoryConfig(settings: Settings): MemoryRuntimeConfig {

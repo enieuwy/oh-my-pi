@@ -48,7 +48,8 @@ import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
 import { cfgDefaultThinkingLevel, cfgProvidersFireworksTier } from "./settings";
-import { cfgDisabledProviders, cfgEnabledModels } from "../config/model-settings";
+import { cfgDisabledModels, cfgDisabledProviders, cfgEnabledModels } from "../config/model-settings";
+import { disabledModelRule, withoutDisabledModels } from "../config/disabled-models";
 
 /** Capabilities borrowed from the owning AgentSession. */
 export interface ModelControlsHost {
@@ -142,11 +143,16 @@ export class ModelControls {
 		return this.#autoResolvedLevel;
 	}
 
-	/** Models explicitly scoped to the session's cycle command, minus currently disabled providers. */
+	/** Models explicitly scoped to the session's cycle command, minus currently disabled providers and denied models. */
 	get scopedModels(): ReadonlyArray<{ model: Model; thinkingLevel?: ThinkingLevel }> {
 		const disabledProviders = cfgDisabledProviders.get(this.#host.settings);
-		if (disabledProviders.length === 0) return this.#scopedModels;
-		return this.#scopedModels.filter(scoped => !disabledProviders.includes(scoped.model.provider));
+		const hasDisabledModels = cfgDisabledModels.get(this.#host.settings).length > 0;
+		if (disabledProviders.length === 0 && !hasDisabledModels) return this.#scopedModels;
+		return this.#scopedModels.filter(
+			scoped =>
+				!disabledProviders.includes(scoped.model.provider) &&
+				(!hasDisabledModels || disabledModelRule(scoped.model, this.#host.settings) === undefined),
+		);
 	}
 
 	/**
@@ -194,17 +200,22 @@ export class ModelControls {
 	restoreServiceTiers(tiers: ServiceTierByFamily): void {
 		this.#serviceTierByFamily = tiers;
 	}
+
+	/** Registry-available models minus those the session's own `disabledModels` deny. */
+	#availableModels(): Model[] {
+		return withoutDisabledModels(this.#host.modelRegistry.getAvailable(), this.#host.settings);
+	}
+
 	resolveRoleModel(role: string): Model | undefined {
-		return resolveRoleModelFull(this.#host.settings, role, this.#host.modelRegistry.getAvailable(), this.#model)
-			.model;
+		return resolveRoleModelFull(this.#host.settings, role, this.#availableModels(), this.#model).model;
 	}
 
 	resolveRoleModelWithThinking(role: string): ResolvedModelRoleValue {
-		return resolveRoleModelFull(this.#host.settings, role, this.#host.modelRegistry.getAvailable(), this.#model);
+		return resolveRoleModelFull(this.#host.settings, role, this.#availableModels(), this.#model);
 	}
 
 	resolveTemporaryModelThinkingLevel(model: Model): ConfiguredThinkingLevel | undefined {
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = this.#availableModels();
 		if (availableModels.length === 0) return undefined;
 
 		const matchPreferences = getModelMatchPreferences(this.#host.settings);
@@ -328,7 +339,7 @@ export class ModelControls {
 	 * still guard on `models.length`).
 	 */
 	getRoleModelCycle(roleOrder: readonly string[]): RoleModelCycle | undefined {
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = this.#availableModels();
 		if (availableModels.length === 0) return undefined;
 
 		const currentModel = this.#model;
@@ -460,7 +471,7 @@ export class ModelControls {
 
 	async #cycleAvailableModel(direction: "forward" | "backward"): Promise<ModelCycleResult | undefined> {
 		const previousEditMode = this.#host.resolveActiveEditMode();
-		const availableModels = this.#host.modelRegistry.getAvailable();
+		const availableModels = this.#availableModels();
 		if (availableModels.length <= 1) return undefined;
 
 		const currentModel = this.#model;
@@ -493,7 +504,7 @@ export class ModelControls {
 	 * See {@link filterAvailableModelsByEnabledPatterns} for supported pattern forms and limitations.
 	 */
 	getAvailableModels(): Model[] {
-		const all = this.#host.modelRegistry.getAvailable();
+		const all = this.#availableModels();
 		const patterns = cfgEnabledModels.get(this.#host.settings);
 		if (!patterns || patterns.length === 0) return all;
 		return filterAvailableModelsByEnabledPatterns(all, patterns, this.#host.settings);

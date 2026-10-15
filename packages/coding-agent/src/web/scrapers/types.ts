@@ -6,6 +6,7 @@ import { ptree } from "@oh-my-pi/pi-utils";
 import type TurndownService from "@oh-my-pi/pi-utils/turndown";
 
 import type { ModelRegistry } from "../../config/model-registry";
+import type { Settings } from "../../config/settings";
 import type { AgentStorage } from "../../session/agent-storage";
 import { ToolAbortError } from "../../tools/tool-errors";
 
@@ -32,6 +33,7 @@ export type SpecialHandler = (
 	signal?: AbortSignal,
 	storage?: AgentStorage | null,
 	modelRegistry?: ModelRegistry,
+	settings?: Settings,
 ) => Promise<RenderResult | null>;
 
 export const MAX_OUTPUT_CHARS = 500_000;

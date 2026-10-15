@@ -83,11 +83,16 @@ interface SessionOptions {
 	cwd?: string;
 	apiKey?: string | null;
 	activeModel?: string;
+	disabledModels?: string[];
 	roles?: Partial<Record<"smol" | "default" | "slow", string>>;
 }
 
 function makeSession(opts: SessionOptions = {}): ToolSession {
-	const settings = Settings.isolated({ "async.enabled": false, "task.isolation.enabled": false });
+	const settings = Settings.isolated({
+		"async.enabled": false,
+		"task.isolation.enabled": false,
+		...(opts.disabledModels ? { disabledModels: opts.disabledModels } : {}),
+	});
 	const roles = opts.roles ?? { smol: "p/smol", slow: "p/slow" };
 	for (const role in roles) {
 		const value = roles[role as keyof typeof roles];
@@ -251,6 +256,17 @@ describe("runEvalCompletion", () => {
 
 		const model = spy.mock.calls[0]?.[0] as Model<Api>;
 		expect(`${model.provider}/${model.id}`).toBe("p/slow");
+	});
+
+	it("refuses a tier role naming a denied model instead of fuzzy-matching an available sibling", async () => {
+		const sibling = makeModel("p", "smol-mini");
+		const session = makeSession({ available: [SMOL, sibling, DEFAULT, SLOW], disabledModels: ["p/smol"] });
+		const spy = vi.spyOn(ai, "completeSimple").mockResolvedValue(assistant({ text: "ok" }));
+
+		await expect(runEvalCompletionAndWait({ prompt: "q", model: "smol" }, { session })).rejects.toThrow(
+			'Model "p/smol" is disabled by disabledModels rule "p/smol". Remove or narrow that rule to use it.',
+		);
+		expect(spy).not.toHaveBeenCalled();
 	});
 
 	it("uses the tier fallback chain after the primary model fails", async () => {

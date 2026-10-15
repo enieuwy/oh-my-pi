@@ -38,6 +38,7 @@ import {
 	modelPresetSavedMessage,
 	saveModelPreset,
 } from "../../config/model-presets";
+import { disabledModelRule, formatDisabledModelError, withSessionDisabledModels } from "../../config/disabled-models";
 import { resolveAdvisorRoleSelection, resolveModelRoleValue } from "../../config/model-resolver";
 import { formatModelSelectorValue } from "@oh-my-pi/pi-tui/overlays/model-selector";
 import { getRoleInfo } from "../../config/model-roles";
@@ -513,7 +514,8 @@ export class SelectorController {
 			);
 			const defaultAdvisorModel = advisorRoleSel?.model;
 			const deps: AdvisorConfigDeps = {
-				getAvailableModels: () => this.ctx.session.modelRegistry.getAvailable(),
+				getAvailableModels: () =>
+					withSessionDisabledModels(this.ctx.session.modelRegistry, this.ctx.settings).getAvailable(),
 				browserSource: createModelBrowserSource(this.ctx.settings, model =>
 					this.ctx.session.effectiveServiceTier(model),
 				),
@@ -810,7 +812,7 @@ export class SelectorController {
 		const picker = new ModelPickerComponent(
 			this.ctx.ui,
 			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
-			this.ctx.session.modelRegistry,
+			withSessionDisabledModels(this.ctx.session.modelRegistry, this.ctx.settings),
 			this.ctx.session.scopedModels,
 			{
 				onPick: async (model, selector, { overContext }) => {
@@ -898,7 +900,7 @@ export class SelectorController {
 		const hub = new ModelHubComponent(
 			this.ctx.ui,
 			createModelBrowserSource(this.ctx.settings, model => this.ctx.session.effectiveServiceTier(model)),
-			this.ctx.session.modelRegistry,
+			withSessionDisabledModels(this.ctx.session.modelRegistry, this.ctx.settings),
 			this.ctx.session.scopedModels,
 			{
 				onAssign: async (model, role, thinkingLevel, selector, scope?: ModelRoleSelectionScope) => {
@@ -910,6 +912,9 @@ export class SelectorController {
 						configuredStorage === "project" ? `${targetScope === "project" ? "Project" : "Global"} ` : "";
 					const defaultStatusLabel = configuredStorage === "project" ? `${scopeLabel}default` : "Default";
 					try {
+						// The hub's catalog view lists models that are not available; a denied one is never assigned.
+						const deniedBy = disabledModelRule(model, this.ctx.settings);
+						if (deniedBy !== undefined) throw new Error(formatDisabledModelError(model, deniedBy));
 						if (role === "default") {
 							// `auto` on the default role configures the active session. Other roles
 							// persist an explicit `:auto` suffix and must not mutate the current model.
@@ -1024,6 +1029,12 @@ export class SelectorController {
 								const resolved = resolveModelRoleValue(fallbackRoleValue, availableModels, {
 									settings: this.ctx.settings,
 								});
+								// A stored default that names only denied models stays stored; say why the session keeps its model.
+								if (!resolved.model && resolved.disabledModel) {
+									this.ctx.showWarning(
+										formatDisabledModelError(resolved.disabledModel.label, resolved.disabledModel.rule),
+									);
+								}
 								const live = this.ctx.session.model;
 								const liveDiffers =
 									!live ||

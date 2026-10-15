@@ -3,6 +3,8 @@ import type { AuthStorage } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { cfgRetryFallbackChains } from "@oh-my-pi/pi-coding-agent/session/settings";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { fetchReadUrl } from "@oh-my-pi/pi-coding-agent/tools/fetch";
 import { handleTwitter } from "@oh-my-pi/pi-coding-agent/web/scrapers/twitter";
 import { parseXUrl, type XTarget } from "@oh-my-pi/pi-coding-agent/web/x";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -106,5 +108,38 @@ describe("handleTwitter", () => {
 
 		expect(result?.method).toBe("x-unavailable");
 		expect(result?.content).toContain("upstream exploded");
+	});
+
+	it("applies the requesting session's disabledModels even when the registry's settings allow xAI", async () => {
+		const modelRegistry = await xaiRegistry();
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const sessionSettings = Settings.isolated({ disabledModels: ["xai/*"] });
+
+		const result = await handleTwitter(
+			"https://x.com/jack/status/20",
+			10,
+			undefined,
+			null,
+			modelRegistry,
+			sessionSettings,
+		);
+
+		expect(result?.method).toBe("x-unavailable");
+		expect(fetchSpy).not.toHaveBeenCalled();
+	});
+
+	it("threads the fetching session's settings into the X reader", async () => {
+		const modelRegistry = await xaiRegistry();
+		const fetchSpy = vi.spyOn(globalThis, "fetch");
+		const session = {
+			settings: Settings.isolated({ disabledModels: ["xai/*"] }),
+			modelRegistry,
+			getActiveModel: () => undefined,
+		} as unknown as ToolSession;
+
+		const entry = await fetchReadUrl(session, { path: "https://x.com/jack/status/20" });
+
+		expect(entry.details.method).toBe("x-unavailable");
+		expect(fetchSpy).not.toHaveBeenCalled();
 	});
 });

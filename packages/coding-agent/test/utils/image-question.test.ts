@@ -48,3 +48,36 @@ describe("resolveImageQuestionModel wire truth (#9697)", () => {
 		);
 	});
 });
+
+describe("resolveImageQuestionModel with disabledModels", () => {
+	const vision = makeProxyModel("qwen-vl");
+	const denied = makeProxyModel("blocked-vl");
+	const sessionWith = (roles: Record<string, string>) => {
+		const session = makeSession(vision, [vision, denied]);
+		return {
+			...session,
+			settings: Settings.isolated({ disabledModels: ["myproxy/blocked-vl"], modelRoles: roles }),
+		} as ToolSession;
+	};
+
+	it("serves an allowed vision role even when the default role is denied", () => {
+		const resolved = resolveImageQuestionModel(
+			sessionWith({ vision: "myproxy/qwen-vl", default: "myproxy/blocked-vl" }),
+		);
+		expect(resolved.model.id).toBe("qwen-vl");
+	});
+
+	it("refuses a denied vision role, naming the rule, instead of using another model", () => {
+		expect(() => resolveImageQuestionModel(sessionWith({ vision: "myproxy/blocked-vl" }))).toThrow(
+			'Model "myproxy/blocked-vl" is disabled by disabledModels rule "myproxy/blocked-vl". Remove or narrow that rule to use it.',
+		);
+	});
+
+	it("refuses the denied default role when the configured vision role is unavailable", () => {
+		expect(() =>
+			resolveImageQuestionModel(sessionWith({ vision: "myproxy/not-installed", default: "myproxy/blocked-vl" })),
+		).toThrow(
+			'Model "myproxy/blocked-vl" is disabled by disabledModels rule "myproxy/blocked-vl". Remove or narrow that rule to use it.',
+		);
+	});
+});

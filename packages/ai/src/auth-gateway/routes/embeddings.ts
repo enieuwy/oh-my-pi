@@ -8,6 +8,7 @@ import {
 	buildGatewayApiKeyResolver,
 	mirrorRequestAbort,
 	recordGatewayUsage,
+	rejectUnresolvedModel,
 	resolveGatewayApiKey,
 } from "../dispatch";
 import { gatewayResponseHeaders, json, resolveClientIdentity } from "../http";
@@ -37,7 +38,8 @@ export async function handleEmbeddings(
 
 	const model = bootOpts.resolveModel(parsed.modelId);
 	if (!model) {
-		return embeddings.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+		const rejection = rejectUnresolvedModel(bootOpts, parsed.modelId);
+		return embeddings.formatError(rejection.status, rejection.type, rejection.message);
 	}
 	if (model.api !== "openai-embeddings") {
 		return embeddings.formatError(

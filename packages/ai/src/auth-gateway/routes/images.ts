@@ -9,6 +9,7 @@ import {
 	buildGatewayApiKeyResolver,
 	mirrorRequestAbort,
 	recordGatewayUsage,
+	rejectUnresolvedModel,
 	resolveGatewayApiKey,
 } from "../dispatch";
 import { gatewayResponseHeaders, json, resolveClientIdentity } from "../http";
@@ -56,7 +57,8 @@ async function handleImages(
 
 	const model = bootOpts.resolveModel(parsed.modelId);
 	if (!model) {
-		return imagesServer.formatError(404, "invalid_request_error", `Unknown model: ${parsed.modelId}`);
+		const rejection = rejectUnresolvedModel(bootOpts, parsed.modelId);
+		return imagesServer.formatError(rejection.status, rejection.type, rejection.message);
 	}
 	if (model.api === "openai-responses" || model.api === "openai-codex-responses") {
 		return imagesServer.formatError(
